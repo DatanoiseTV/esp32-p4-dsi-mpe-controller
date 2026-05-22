@@ -675,6 +675,18 @@ extern "C" void app_main(void)
     int fps_disp = 0;
     int64_t last_fps_us = esp_timer_get_time();
 
+    /* Cap the render loop to a fixed period so:
+        - We never queue draw_bitmaps faster than the DSI can swap
+          them (which used to saturate the panel driver's internal
+          queue and produce 8-15 FPS spikes between bursts of 120).
+        - The scheduler reliably hands CPU to IDLE0 between frames,
+          feeding the task watchdog without an explicit vTaskDelay.
+        - We don't burn power rendering frames the panel can't show.
+       16 ms ≈ 60 FPS = the panel refresh rate, with a little headroom
+       for the render itself. */
+    const TickType_t kFramePeriod = pdMS_TO_TICKS(16);
+    TickType_t next_frame = xTaskGetTickCount();
+
     /* Local snapshot we render from so we don't hold the controller
        mutex across the (potentially 16 ms) render. */
     mpe_controller   snap_ctrl;
@@ -859,9 +871,9 @@ extern "C" void app_main(void)
                      heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         }
 
-        /* Yield 1 tick so IDLE0 actually runs — otherwise this loop
-           runs at ~125 FPS on a tight schedule and the task watchdog
-           trips every 5 s because IDLE0 (CPU 0) never feeds it. */
-        vTaskDelay(1);
+        /* Pace to the panel's refresh. vTaskDelayUntil also yields
+           the rest of the period to IDLE, so the task watchdog
+           gets fed without a separate vTaskDelay. */
+        vTaskDelayUntil(&next_frame, kFramePeriod);
     }
 }
