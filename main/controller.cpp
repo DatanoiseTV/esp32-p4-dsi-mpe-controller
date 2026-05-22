@@ -482,6 +482,25 @@ int mpe_controller_update(mpe_controller *c, const mpe_touch_frame *f)
         mpe_finger *fg = &c->fingers[i];
         if (!fg->active) continue;
         if (seen[i]) { active++; continue; }
+
+        /* Stamp the finger's last touched key into the residual
+           cleanup queue so the renderer keeps restoring that area
+           for the next ~200 ms across both buffers. Without this,
+           a borderline-timed release leaves an alpha-blended halo
+           in the framebuffer that the normal dirty-rect chain
+           somehow misses. */
+        if (!fg->is_ui &&
+            fg->key_idx >= 0 && fg->key_idx < c->kb.n_keys &&
+            c->n_residual < MPE_RESIDUAL_CAP) {
+            const mpe_key *k = &c->kb.keys[fg->key_idx];
+            mpe_residual_dirty *r = &c->residual[c->n_residual++];
+            r->x = k->x;
+            r->y = k->y;
+            r->w = k->w;
+            r->h = k->h;
+            r->expire_us = now + 200000;
+        }
+
         if (!fg->is_ui) {
             mpe_applemidi_channel_pressure((uint8_t)fg->ch, 0);
             mpe_applemidi_note_off((uint8_t)fg->ch, (uint8_t)fg->note, 64);
@@ -491,6 +510,17 @@ int mpe_controller_update(mpe_controller *c, const mpe_touch_frame *f)
         fg->ch          = -1;
         fg->key_idx     = -1;
         fg->is_ui       = false;
+    }
+
+    /* Garbage-collect expired residuals. Swap-and-pop to keep the
+       array dense without holes. */
+    for (int i = 0; i < c->n_residual; ) {
+        if (c->residual[i].expire_us <= now) {
+            c->residual[i] = c->residual[c->n_residual - 1];
+            c->n_residual--;
+        } else {
+            i++;
+        }
     }
 
     /* OSC bundle. */

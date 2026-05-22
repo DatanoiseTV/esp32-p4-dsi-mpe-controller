@@ -137,6 +137,18 @@ typedef struct {
     int   ui_h;
 } mpe_controller_cfg;
 
+/* A short-lived "this finger just released; please keep restoring
+   the screen at this rectangle for a few frames" entry. Without it,
+   the buffer-pair dirty-rect bookkeeping is theoretically airtight
+   but in practice misses certain release transitions and leaves
+   stuck halos on the panel. The residual TTL gives the renderer
+   multiple restore passes on both buffers — a robust backstop. */
+#define MPE_RESIDUAL_CAP   8
+typedef struct {
+    int16_t x, y, w, h;
+    int64_t expire_us;
+} mpe_residual_dirty;
+
 typedef struct {
     mpe_controller_cfg cfg;
     mpe_keyboard       kb;
@@ -155,6 +167,11 @@ typedef struct {
     mpe_button         buttons[MPE_MAX_BUTTONS];
 
     mpe_finger         fingers[MPE_CTRL_MAX_FINGERS];
+
+    /* Stale-region cleanup queue — populated on finger release. */
+    int                n_residual;
+    mpe_residual_dirty residual[MPE_RESIDUAL_CAP];
+
     int64_t            last_osc_emit_us;
     float              ch_busy_recency[16];
     void              *lock;

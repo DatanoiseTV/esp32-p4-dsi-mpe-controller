@@ -722,6 +722,18 @@ extern "C" void app_main(void)
                        2 * glow_margin, 2 * glow_margin);
         }
 
+        /* Released-finger residuals (stuck-halo backstop). The
+           controller marks the last touched key area for ~200 ms
+           after each finger lifts so multiple restore passes are
+           guaranteed on both buffers regardless of the normal
+           dirty-rect bookkeeping. */
+        for (int i = 0; i < snap_ctrl.n_residual; i++) {
+            const mpe_residual_dirty *r = &snap_ctrl.residual[i];
+            dirty_push(&cur,
+                       r->x - 4, r->y - 4,
+                       r->w + 8, r->h + 8);
+        }
+
         /* Restore both lists (previous frame this buffer + current).
            Some pixels get touched twice — fine, the copy is idempotent. */
         const dirty_list_t *prev = &s_prev_dirty[s_back_local];
