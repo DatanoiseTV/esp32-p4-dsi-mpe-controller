@@ -1,0 +1,7 @@
+# ESP32-P4-Nano 16 MB flash. The MPE controller is far smaller than
+# the embedded-browser sibling, so 4 MB for the app + ample headroom
+# for future additions (sample playback, NVS prefs, OTA).
+# Name,    Type, SubType, Offset,  Size,  Flags
+nvs,       data, nvs,     0x9000,  24K,
+phy_init,  data, phy,     0xf000,  4K,
+factory,   app,  factory, 0x10000, 4M,

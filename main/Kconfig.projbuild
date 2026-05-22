@@ -1,0 +1,158 @@
+menu "esp32-p4-nano-mpempe"
+
+    menu "Display (EK79007 1024x600 MIPI-DSI panel)"
+        config DISP_PIN_LCD_RST
+            int "GPIO connected to RST_LCD on the panel breakout"
+            default 2
+            range 0 54
+
+        config DISP_PIN_LCD_BL
+            int "GPIO connected to PWM (backlight) on the panel breakout"
+            default 3
+            range 0 54
+
+        config DISP_DSI_LANE_BITRATE_MBPS
+            int "DSI lane bit rate (Mbps)"
+            default 1000
+            range 500 1500
+
+        config DISP_DPI_CLOCK_FREQ_MHZ
+            int "DPI pixel clock (MHz) — controls refresh rate"
+            default 65
+            range 40 100
+
+        config DISP_BL_DEFAULT_PCT
+            int "Default backlight brightness (%)"
+            default 80
+            range 0 100
+
+        config DISP_PIN_TOUCH_SDA
+            int "GPIO for I2C SDA (GT911 touch, carried by the DSI FFC)"
+            default 7
+            range 0 54
+
+        config DISP_PIN_TOUCH_SCL
+            int "GPIO for I2C SCL (GT911 touch, carried by the DSI FFC)"
+            default 8
+            range 0 54
+    endmenu
+
+    menu "WiFi (via on-board ESP32-C6 over SDIO)"
+        config WIFI_SSID
+            string "WiFi SSID"
+            default ""
+
+        config WIFI_PASSWORD
+            string "WiFi password"
+            default ""
+
+        config WIFI_MAX_RETRY
+            int "Max reconnection attempts before giving up"
+            default 10
+            range 1 50
+    endmenu
+
+    menu "MIDI (RTP-MIDI / AppleMIDI)"
+        config MPE_MIDI_HOST
+            string "Target host (IP or hostname) for the RTP-MIDI peer"
+            default "192.168.1.10"
+            help
+                Address of the RTP-MIDI session listener: macOS Audio
+                MIDI Setup network session, Windows rtpMIDI driver,
+                or Linux rtpmidid. Empty disables MIDI output.
+
+        config MPE_MIDI_PORT
+            int "Control port of the RTP-MIDI peer"
+            default 5004
+            range 1024 65535
+            help
+                AppleMIDI sessions use this port for control and
+                (port + 1) for the MIDI payload. The default 5004
+                matches macOS Network MIDI defaults.
+
+        config MPE_MIDI_SESSION_NAME
+            string "Session name advertised to the peer"
+            default "ESP32-P4 MPE"
+
+        config MPE_MIDI_PB_RANGE_SEMITONES
+            int "Per-note pitch-bend range (semitones)"
+            default 48
+            range 2 96
+            help
+                Tells the host how to scale per-channel pitch bend.
+                48 is the LinnStrument default (full keyboard range);
+                use 2 for traditional, 12 for one-octave slides.
+    endmenu
+
+    menu "OSC"
+        config MPE_OSC_HOST
+            string "Target host (IP or hostname) for OSC datagrams"
+            default "192.168.1.10"
+            help
+                Empty disables OSC output. Sent independently of MIDI;
+                useful as a high-resolution sidechain for SuperCollider,
+                Pure Data, TouchDesigner, etc.
+
+        config MPE_OSC_PORT
+            int "Target UDP port for OSC"
+            default 9000
+            range 1024 65535
+
+        config MPE_OSC_BUNDLE_HZ
+            int "OSC bundle rate (Hz)"
+            default 200
+            range 30 500
+            help
+                The renderer coalesces touch updates into one OSC
+                bundle per period. 200 Hz is well below the GT911 sample
+                rate but plenty for most receivers; bump for very low
+                end-to-end latency.
+    endmenu
+
+    menu "Instrument (Seaboard-style dual keyboard)"
+        config MPE_KEYBOARD_ROWS
+            int "Keyboard rows on screen"
+            default 2
+            range 1 3
+            help
+                Two stacked piano keyboards by default — bass range
+                on the bottom row, treble on the top row.
+
+        config MPE_OCTAVES_PER_ROW
+            int "Octaves visible per row"
+            default 3
+            range 2 4
+            help
+                At 3 octaves × 1024 px, white keys are ~49 px wide —
+                comfortable for finger play with room for slide
+                expression.
+
+        config MPE_LOWEST_OCTAVE
+            int "Scientific-pitch octave of the BOTTOM row's leftmost C"
+            default 2
+            range -1 8
+            help
+                2 = C2 (low E-string territory).
+                Change at runtime via the on-screen Row 1 octave
+                stepper buttons.
+
+        config MPE_ROW_OCTAVE_OFFSET
+            int "Octaves between rows (top row's C = bottom row's C + this)"
+            default 3
+            range 1 5
+            help
+                3 matches the keyboard's own octave span, so the two
+                rows cover a continuous, non-overlapping range.
+
+        config MPE_VELOCITY_FIXED
+            int "Initial velocity (0 = derive from contact size)"
+            default 0
+            range 0 127
+            help
+                0 = derive from GT911 contact area at NoteOn. The
+                chip reports area not real force, but heavier presses
+                spread the fingerprint and produce a usable velocity
+                proxy. Set non-zero for a fixed-velocity controller.
+    endmenu
+
+endmenu

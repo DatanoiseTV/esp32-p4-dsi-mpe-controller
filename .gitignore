@@ -1,0 +1,9 @@
+build/
+managed_components/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+*.bak
+.DS_Store
+.vscode/
+docs/.screenshot.bmp
