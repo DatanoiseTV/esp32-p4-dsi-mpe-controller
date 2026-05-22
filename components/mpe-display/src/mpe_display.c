@@ -128,9 +128,15 @@ void *mpe_display_i2c_bus(void)
     return (void *)s_i2c_bus;
 }
 
-static bool IRAM_ATTR vsync_cb_(esp_lcd_panel_handle_t panel,
-                                esp_lcd_dpi_panel_event_data_t *edata,
-                                void *user_ctx)
+/* Fires when a draw_bitmap-queued buffer swap actually finishes
+   scanning out. In IDF v6.0 this is the dependable per-present
+   notification on the EK79007 / DPI path; on_refresh_done (which
+   was meant to fire every refresh, not just on swap) doesn't
+   actually fire on this stack — apps that waited on it deadlocked
+   on the very first present. */
+static bool IRAM_ATTR swap_done_cb_(esp_lcd_panel_handle_t panel,
+                                    esp_lcd_dpi_panel_event_data_t *edata,
+                                    void *user_ctx)
 {
     (void)panel; (void)edata; (void)user_ctx;
     BaseType_t hp = pdFALSE;
@@ -201,7 +207,7 @@ esp_err_t mpe_display_init(void)
     if (!s_vsync_sem) return ESP_ERR_NO_MEM;
 
     esp_lcd_dpi_panel_event_callbacks_t cbs = {};
-    cbs.on_refresh_done = vsync_cb_;
+    cbs.on_color_trans_done = swap_done_cb_;
     ESP_RETURN_ON_ERROR(
         esp_lcd_dpi_panel_register_event_callbacks(s_panel, &cbs, NULL),
         TAG, "register_event_callbacks");
