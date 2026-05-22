@@ -261,9 +261,22 @@ void mpe_display_rect_copy(uint16_t *dst, const uint16_t *src,
     if (y + h > MPE_DISPLAY_HEIGHT) h = MPE_DISPLAY_HEIGHT - y;
     if (w <= 0 || h <= 0) return;
 
-    /* Tiny rects: PPA setup overhead beats the actual transfer.
-       PSRAM-to-PSRAM memcpy below ~2 KB is faster as a tight loop. */
-    if (s_ppa_srm == NULL || (size_t)w * (size_t)h < 1024) {
+    /* CPU memcpy path. We default to this for everything below the
+       full-screen threshold because PPA DMA bypasses the CPU cache:
+       after PPA writes the rect, the CPU still holds stale cache
+       lines for that region. The follow-up M2C invalidate is meant
+       to drop those lines, but it isn't reliably effective on this
+       stack — the visible symptom is "stuck halos" on keys, where
+       the next frame's alpha-blend reads the cached old halo,
+       blends new content against it, and writes back, leaving a
+       ghost the dirty-rect restore can't clear.
+       memcpy goes through the cache so subsequent CPU reads /
+       writes are always coherent. The PPA path is kept only for
+       the (rare) full-screen rebake, where setup overhead is
+       negligible against ~1.2 MB of data. */
+    if (s_ppa_srm == NULL ||
+        (size_t)w * (size_t)h <
+            (size_t)MPE_DISPLAY_WIDTH * MPE_DISPLAY_HEIGHT / 2) {
         const int stride = MPE_DISPLAY_WIDTH;
         for (int ry = 0; ry < h; ry++) {
             memcpy(dst + (size_t)(y + ry) * stride + x,
