@@ -349,11 +349,25 @@ esp_err_t mpe_display_present(void)
         s_panel, 0, 0,
         MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT,
         s_fbs[s_back_idx]);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "draw_bitmap failed: %s", esp_err_to_name(err));
+        return err;
+    }
 
-    /* Drop any stale signal then wait for the next refresh-done. */
+    /* Drop any stale signal then wait for the next refresh-done.
+       The wait has a generous timeout: on a healthy 60 Hz panel the
+       callback fires every ~17 ms, so 100 ms is ~6× the worst-case
+       wait. If we time out it means the refresh-done callback never
+       fired (panel didn't actually start scanout, or the
+       on_refresh_done dispatcher is wedged) — we log it and continue
+       rather than deadlocking the entire app on startup. */
     xSemaphoreTake(s_vsync_sem, 0);
-    xSemaphoreTake(s_vsync_sem, portMAX_DELAY);
+    if (xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(100)) != pdTRUE) {
+        static int s_warn = 0;
+        if ((s_warn++ % 60) == 0) {
+            ESP_LOGW(TAG, "vsync wait timed out — panel not refreshing?");
+        }
+    }
 
     s_back_idx ^= 1;
     return ESP_OK;

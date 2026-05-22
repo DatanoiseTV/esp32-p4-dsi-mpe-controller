@@ -404,8 +404,13 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "font init failed — labels disabled");
     }
 
-    /* Splash on the first back buffer while WiFi associates. */
+    /* Splash on the first back buffer while WiFi associates. The
+       splash present is also the first time we drive the panel's
+       buffer-swap path; if anything has gone wrong with vsync /
+       refresh-done, this is where it manifests, so we log around
+       it. */
     {
+        ESP_LOGI(TAG, "splash: painting");
         uint16_t *fb = mpe_display_back_buffer();
         mp_target t = { fb, MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT };
         mp_gradient_v(&t, 0, 0, t.width, t.height,
@@ -420,7 +425,9 @@ extern "C" void app_main(void)
                                     t.height / 2 + 14,
                                     "connecting WiFi…", 22,
                                     mp_rgb565(0x70, 0x80, 0x98));
+        ESP_LOGI(TAG, "splash: presenting");
         mpe_display_present();
+        ESP_LOGI(TAG, "splash: shown");
     }
 
     /* 4. WiFi. */
