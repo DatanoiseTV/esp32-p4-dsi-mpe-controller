@@ -23,6 +23,18 @@ extern "C" {
    if the retry budget was exhausted. Safe to call once from app_main. */
 esp_err_t mpe_wifi_init_blocking(void);
 
+/* Asynchronous variant: do all the NVS / netif / esp_wifi_start setup
+   but don't block. Returns ESP_OK on a successful kick-off; the
+   caller polls mpe_wifi_wait() to see when the link comes up. */
+esp_err_t mpe_wifi_start_async(void);
+
+/* Poll the association state with a bounded wait.
+     ESP_OK            — associated and IP-up
+     ESP_FAIL          — retries exhausted
+     ESP_ERR_TIMEOUT   — still trying, came back from the wait timeout
+   wait_ms = 0 returns immediately. */
+esp_err_t mpe_wifi_wait(int wait_ms);
+
 bool      mpe_wifi_is_up(void);
 
 /* On success, fills `out` with a null-terminated dotted-quad of the

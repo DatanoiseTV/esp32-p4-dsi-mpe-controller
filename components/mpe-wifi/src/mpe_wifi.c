@@ -52,7 +52,7 @@ static void evt_handler(void *arg, esp_event_base_t base,
     }
 }
 
-esp_err_t mpe_wifi_init_blocking(void)
+esp_err_t mpe_wifi_start_async(void)
 {
     if (strlen(CONFIG_WIFI_SSID) == 0) {
         ESP_LOGE(TAG, "CONFIG_WIFI_SSID is empty — set it via menuconfig");
@@ -92,6 +92,25 @@ esp_err_t mpe_wifi_init_blocking(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wcfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+    return ESP_OK;
+}
+
+esp_err_t mpe_wifi_wait(int wait_ms)
+{
+    if (!s_evt) return ESP_ERR_INVALID_STATE;
+    EventBits_t bits = xEventGroupWaitBits(
+        s_evt, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+        pdFALSE, pdFALSE,
+        wait_ms <= 0 ? 0 : pdMS_TO_TICKS(wait_ms));
+    if (bits & WIFI_CONNECTED_BIT) return ESP_OK;
+    if (bits & WIFI_FAIL_BIT)      return ESP_FAIL;
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t mpe_wifi_init_blocking(void)
+{
+    esp_err_t err = mpe_wifi_start_async();
+    if (err != ESP_OK) return err;
 
     EventBits_t bits = xEventGroupWaitBits(
         s_evt, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,

@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <atomic>
 
 extern "C" {
@@ -124,6 +125,95 @@ static void dirty_push(dirty_list_t *d, int x, int y, int w, int h)
 static void restore_rect_(uint16_t *back, const uint16_t *templ, rect_t r)
 {
     mpe_display_rect_copy(back, templ, r.x, r.y, r.w, r.h);
+}
+
+/* --- Boot-screen animation -------------------------------------- *
+ *
+ * Drawn while WiFi is associating. Composed of a dark gradient
+ * backdrop, the title + subtitle, an animated 5-bar equalizer
+ * coloured by the same palette the player will see on their fingers
+ * during play (ch2..ch6), and a status line that ticks the elapsed
+ * seconds + the SSID being attempted. Each bar pulses on its own
+ * frequency + phase so the cluster has a "living, listening" feel
+ * instead of a synced-jump LED-strip look. */
+
+static void draw_boot_screen(const mp_target *t, float t_s, const char *ssid)
+{
+    /* Background gradient — same palette as the runtime template
+       so the transition into the keyboard is seamless. */
+    mp_gradient_v(t, 0, 0, t->width, t->height,
+                  0x0d, 0x10, 0x1f,
+                  0x02, 0x03, 0x0a);
+
+    /* Title block, vertically centred-ish above the equalizer. */
+    mpe_font_draw_text_centered(t->fb, t->width, t->height,
+                                t->width / 2, 140,
+                                "MPE", 64,
+                                mp_rgb565(0xea, 0xee, 0xff));
+    mpe_font_draw_text_centered(t->fb, t->width, t->height,
+                                t->width / 2, 214,
+                                "controller", 22,
+                                mp_rgb565(0x88, 0x98, 0xb0));
+
+    /* Equalizer bars — 5, matching the MPE member-channel count.
+       Heights drive off a sine of (t + per-bar phase) so each bar
+       has its own rhythm. */
+    static const struct { uint8_t r, g, b; float speed; float phase; }
+        bar[5] = {
+        { 0x00, 0xCC, 0xFF, 1.7f, 0.0f },   /* cyan   */
+        { 0xFF, 0x33, 0x99, 1.4f, 1.2f },   /* pink   */
+        { 0x66, 0xFF, 0x33, 1.9f, 2.4f },   /* lime   */
+        { 0xFF, 0x99, 0x00, 1.3f, 3.6f },   /* amber  */
+        { 0xBB, 0x44, 0xFF, 1.6f, 4.8f },   /* violet */
+    };
+    const int bar_w     = 36;
+    const int bar_gap   = 14;
+    const int bar_h_max = 130;
+    const int bar_h_min = 16;
+    const int total_w   = 5 * bar_w + 4 * bar_gap;
+    const int x_start   = (t->width - total_w) / 2;
+    const int y_base    = 380;
+
+    for (int i = 0; i < 5; i++) {
+        float h_norm = 0.5f + 0.5f * sinf(t_s * bar[i].speed + bar[i].phase);
+        int h = bar_h_min + (int)(h_norm * (float)(bar_h_max - bar_h_min));
+        int x = x_start + i * (bar_w + bar_gap);
+        int y = y_base - h;
+
+        /* Soft additive halo behind each bar — channel-coloured. */
+        mp_glow_add(t, x + bar_w / 2, y + h / 2,
+                    bar_w + 16,
+                    (uint8_t)(bar[i].r * 5 / 10),
+                    (uint8_t)(bar[i].g * 5 / 10),
+                    (uint8_t)(bar[i].b * 5 / 10));
+        /* Bar body with a vertical gradient (brighter at top). */
+        mp_gradient_v(t, x, y, bar_w, h,
+                      bar[i].r, bar[i].g, bar[i].b,
+                      (uint8_t)(bar[i].r * 4 / 10),
+                      (uint8_t)(bar[i].g * 4 / 10),
+                      (uint8_t)(bar[i].b * 4 / 10));
+        /* Bright cap at the top — like a peak indicator. */
+        mp_fill_rect_a(t, x, y, bar_w, 3, 0xff, 0xff, 0xff, 200);
+    }
+
+    /* Status line: connection progress. */
+    char status[96];
+    const int secs = (int)t_s;
+    /* Animated ellipsis: 0..3 dots based on time. */
+    const char *dots[] = { "",  ".",  "..",  "..." };
+    snprintf(status, sizeof status, "Connecting to %s%s (%ds)",
+             (ssid && ssid[0]) ? ssid : "WiFi",
+             dots[secs % 4], secs);
+    mpe_font_draw_text_centered(t->fb, t->width, t->height,
+                                t->width / 2, 500,
+                                status, 18,
+                                mp_rgb565(0xa0, 0xb0, 0xc8));
+
+    /* Small caption below — what the device is going to be. */
+    mpe_font_draw_text_centered(t->fb, t->width, t->height,
+                                t->width / 2, 540,
+                                "RTP-MIDI / OSC over WiFi", 14,
+                                mp_rgb565(0x50, 0x60, 0x78));
 }
 
 /* --- Static template renderer ----------------------------------- */
@@ -404,37 +494,41 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "font init failed — labels disabled");
     }
 
-    /* Splash on the first back buffer while WiFi associates. The
-       splash present is also the first time we drive the panel's
-       buffer-swap path; if anything has gone wrong with vsync /
-       refresh-done, this is where it manifests, so we log around
-       it. */
-    {
-        ESP_LOGI(TAG, "splash: painting");
-        uint16_t *fb = mpe_display_back_buffer();
-        mp_target t = { fb, MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT };
-        mp_gradient_v(&t, 0, 0, t.width, t.height,
-                      0x0a, 0x0c, 0x18, 0x02, 0x03, 0x08);
-        mpe_font_draw_text_centered(t.fb, t.width, t.height,
-                                    t.width / 2,
-                                    t.height / 2 - 40,
-                                    "MPE controller", 48,
-                                    mp_rgb565(0xea, 0xee, 0xff));
-        mpe_font_draw_text_centered(t.fb, t.width, t.height,
-                                    t.width / 2,
-                                    t.height / 2 + 14,
-                                    "connecting WiFi…", 22,
-                                    mp_rgb565(0x70, 0x80, 0x98));
-        ESP_LOGI(TAG, "splash: presenting");
-        mpe_display_present();
-        ESP_LOGI(TAG, "splash: shown");
-    }
-
-    /* 4. WiFi. */
+    /* 4. WiFi + animated boot screen.
+         The MPE controller is fundamentally a networked instrument
+         (RTP-MIDI + OSC), so we'd rather show the player something
+         alive than freeze on a static splash for 30 seconds while
+         the C6 negotiates association. We start WiFi async, then
+         loop drawing an equalizer-bar animation each frame and
+         polling the link state. */
     bool wifi_ok = false;
     if (strlen(CONFIG_WIFI_SSID) > 0) {
-        wifi_ok = (mpe_wifi_init_blocking() == ESP_OK);
-        if (!wifi_ok) ESP_LOGW(TAG, "WiFi failed — running offline");
+        if (mpe_wifi_start_async() != ESP_OK) {
+            ESP_LOGW(TAG, "WiFi setup failed");
+        } else {
+            const int64_t boot_start_us = esp_timer_get_time();
+            const int64_t boot_timeout_us = 30 * 1000 * 1000;
+            for (;;) {
+                esp_err_t r = mpe_wifi_wait(0);
+                if (r == ESP_OK) { wifi_ok = true; break; }
+                if (r == ESP_FAIL) break;
+                if (esp_timer_get_time() - boot_start_us >= boot_timeout_us) break;
+
+                uint16_t *fb = mpe_display_back_buffer();
+                mp_target target = { fb, MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT };
+                const float t_s = (float)(esp_timer_get_time() - boot_start_us)
+                                  / 1000000.0f;
+                draw_boot_screen(&target, t_s, CONFIG_WIFI_SSID);
+                mpe_display_flush_writes(fb,
+                    (size_t)MPE_DISPLAY_WIDTH * MPE_DISPLAY_HEIGHT * 2);
+                mpe_display_present();
+                /* Cap to ~50 FPS during boot and explicitly yield so
+                   IDLE0 gets a slice — the task watchdog tripped
+                   earlier on tight render loops. */
+                vTaskDelay(pdMS_TO_TICKS(18));
+            }
+            if (!wifi_ok) ESP_LOGW(TAG, "WiFi failed — running offline");
+        }
     } else {
         ESP_LOGW(TAG, "CONFIG_WIFI_SSID empty — network output disabled");
     }
@@ -764,5 +858,10 @@ extern "C" void app_main(void)
                      heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                      heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         }
+
+        /* Yield 1 tick so IDLE0 actually runs — otherwise this loop
+           runs at ~125 FPS on a tight schedule and the task watchdog
+           trips every 5 s because IDLE0 (CPU 0) never feeds it. */
+        vTaskDelay(1);
     }
 }
