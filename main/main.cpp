@@ -788,19 +788,14 @@ extern "C" void app_main(void)
                 any = true;
             }
             if (!any) continue;
-            /* The per-finger floating chip is placed ABOVE the touch
-               point by default, but flips BELOW when too close to
-               the top bar. Either case extends ~75 px past the
-               finger glow, so we pad both Y sides symmetrically.
-               Without the symmetric pad, the chip below a near-top
-               touch would leak past the next frame's restore and
-               leave a ghost. */
-            const int label_extra = 80;
+            /* Just the dot + activity-halo bbox now that the
+               floating chip is gone. glow_margin handles the
+               finger-dot radius + any safety. */
             dirty_push(&cur,
                        min_x - glow_margin,
-                       min_y - glow_margin - label_extra,
+                       min_y - glow_margin,
                        (max_x - min_x) + 2 * glow_margin,
-                       (max_y - min_y) + 2 * glow_margin + 2 * label_extra);
+                       (max_y - min_y) + 2 * glow_margin);
         }
         /* Latest-touch positions may be slightly ahead of the
            controller snapshot — include them too so the glow drawn
