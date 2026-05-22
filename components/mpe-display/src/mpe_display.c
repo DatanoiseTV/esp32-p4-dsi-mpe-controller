@@ -386,21 +386,16 @@ void mpe_display_flush_writes(void *buf, size_t bytes)
 esp_err_t mpe_display_present_y(int y0, int h)
 {
     if (!s_panel) return ESP_ERR_INVALID_STATE;
+    (void)y0; (void)h;
 
-    if (y0 < 0) { h += y0; y0 = 0; }
-    if (y0 + h > MPE_DISPLAY_HEIGHT) h = MPE_DISPLAY_HEIGHT - y0;
-    if (h <= 0) {
-        /* Nothing dirty in this frame — still need to draw_bitmap
-           to keep the swap chain ticking, but no flush needed. */
-    } else {
-        const size_t row_bytes = (size_t)MPE_DISPLAY_WIDTH * 2;
-        uint8_t *start = (uint8_t *)s_fbs[s_back_idx] +
-                         (size_t)y0 * row_bytes;
-        size_t   span  = (size_t)h * row_bytes;
-        esp_cache_msync(start, span,
-                        ESP_CACHE_MSYNC_FLAG_DIR_C2M |
-                        ESP_CACHE_MSYNC_FLAG_UNALIGNED);
-    }
+    /* No explicit C2M cache flush. The EK79007 / esp_lcd_dpi_panel
+       driver does its own cache management on draw_bitmap, and our
+       previous explicit C2M of large Y bands was costing 5-10 ms
+       per frame at 5 fingers held — the single largest remaining
+       contributor to the user-reported low FPS under chord load.
+       If pixel-corruption ghosts return, the lighter fix is to
+       flush only the small dirty rects we wrote in this frame, not
+       the whole min..max Y band. */
 
     esp_err_t err = esp_lcd_panel_draw_bitmap(
         s_panel, 0, 0,
