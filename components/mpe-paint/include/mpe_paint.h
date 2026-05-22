@@ -73,6 +73,14 @@ void mp_stroke_rect(const mp_target *t, int x, int y, int w, int h,
 void mp_fill_circle_soft(const mp_target *t, int cx, int cy, int radius,
                          uint8_t r, uint8_t g, uint8_t b, uint8_t alpha);
 
+/* Fast filled circle — opaque, no alpha, no soft edge. Pure RGB565
+   writes inside the disc, ~3× cheaper than mp_fill_circle_soft at
+   alpha=255 because there's no per-pixel unpack/blend/pack round-
+   trip. Use for solid finger dots; the visual is slightly harder-
+   edged than the AA version but is invisible at typical sizes. */
+void mp_fill_circle(const mp_target *t, int cx, int cy, int radius,
+                    uint16_t color);
+
 /* Additive radial gradient: at the center we add (r,g,b) at full
    intensity, falling off to zero at `radius`. Channels saturate at
    255 — this is the right model for stacked finger glows. The

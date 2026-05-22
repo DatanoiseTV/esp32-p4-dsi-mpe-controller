@@ -734,7 +734,9 @@ extern "C" void app_main(void)
            the snapshot). */
         snap_ctrl.lock = nullptr;
 
-        mpe_ui_push_trails(&ui, &snap_ctrl);
+        /* Trails removed — the new solid-dot finger visual doesn't
+           use them, so no per-frame ring-buffer update needed. */
+        (void)ui;
 
         uint16_t *back = mpe_display_back_buffer();
         mp_target target = { back, MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT };
@@ -749,7 +751,12 @@ extern "C" void app_main(void)
         dirty_push(&cur, 0, MPE_UI_STATUS_Y,
                    MPE_DISPLAY_WIDTH, MPE_UI_STATUS_H);
 
-        const int glow_margin = 72;
+        /* Finger-dot max radius is 32 (pressure-scaled); 44 px
+           margin keeps the dirty rect honest with a small safety
+           buffer for the white centre + any per-finger chip
+           overflow. Smaller than the old 72 px glow margin → less
+           per-frame partial-restore work. */
+        const int glow_margin = 44;
         for (int i = 0; i < MPE_CTRL_MAX_FINGERS; i++) {
             const mpe_finger *f = &snap_ctrl.fingers[i];
             if (f->is_ui) continue;  /* UI taps have no glow drawn */
@@ -763,16 +770,6 @@ extern "C" void app_main(void)
                                (int)(f->x_norm * (float)snap_ctrl.cfg.ui_w);
                 const int py = snap_ctrl.cfg.ui_y +
                                (int)((1.0f - f->y_norm) * (float)snap_ctrl.cfg.ui_h);
-                if (px < min_x) min_x = px;
-                if (py < min_y) min_y = py;
-                if (px > max_x) max_x = px;
-                if (py > max_y) max_y = py;
-                any = true;
-            }
-            for (int k = 0; k < MPE_UI_TRAIL_LEN; k++) {
-                if (ui.trails.pts[i][k].intensity < 0.02f) continue;
-                int px = ui.trails.pts[i][k].x;
-                int py = ui.trails.pts[i][k].y;
                 if (px < min_x) min_x = px;
                 if (py < min_y) min_y = py;
                 if (px > max_x) max_x = px;

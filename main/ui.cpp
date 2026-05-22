@@ -130,34 +130,16 @@ void mpe_ui_render(mpe_ui *u, const mp_target *t,
                        col.r, col.g, col.b, a);
     }
 
-    /* 2. trails. */
-    for (int i = 0; i < MPE_CTRL_MAX_FINGERS; i++) {
-        const mpe_finger *f = &c->fingers[i];
-        if (f->is_ui) continue;
-        const rgb col = kChannelColor[(f->ch >= 0 ? f->ch : 0) & 0x0F];
-        for (int k = 0; k < MPE_UI_TRAIL_LEN; k++) {
-            const mpe_ui_trail_pt *p = &u->trails.pts[i][k];
-            /* Tighter intensity floor + smaller radius cap = far less
-               PSRAM bandwidth. The lost intensity (0.08..0.15) was
-               sub-RGB565 quantization for typical channel colours
-               anyway. */
-            if (p->intensity < 0.15f) continue;
-            int radius = 4 + (int)(14.0f * p->intensity);
-            if (radius > 18) radius = 18;
-            uint8_t r = (uint8_t)(col.r * p->intensity);
-            uint8_t g = (uint8_t)(col.g * p->intensity);
-            uint8_t b = (uint8_t)(col.b * p->intensity);
-            mp_glow_add(t, p->x, p->y, radius, r, g, b);
-        }
-    }
-
-    /* 4. current finger glows. Radii are tightly bounded so the
-          dirty-rect margin (FINGER_GLOW_MARGIN_PX in main.cpp)
-          provably covers every pixel we touch — otherwise the next
-          frame's partial-restore leaves halo edges as artifacts.
-          Two passes total (outer + inner) — visually rich enough,
-          and ~3× cheaper than the four-pass version that drove the
-          17 FPS regression. */
+    /* 2. Solid finger dots, pressure-scaled. The previous soft-glow
+          stack (outer additive halo + inner alpha core + AA spec +
+          per-frame decaying trail of 4-8 glow_add passes per finger)
+          was the dominant per-pixel cost — 5 fingers tanked FPS to
+          single digits because every pixel inside ~10K-pixel discs
+          went through a PSRAM read/blend/write cycle. The new model:
+          one opaque circle per finger whose radius encodes Z, plus
+          a small white centre pip at the exact touch position. Pure
+          RGB565 writes, no blends, no per-pixel sqrt — typically
+          ~5× cheaper at 5-finger load. */
     if (latest) {
         for (int i = 0; i < latest->count && i < MPE_TOUCH_MAX_POINTS; i++) {
             const mpe_touch_point *p = &latest->points[i];
@@ -173,18 +155,21 @@ void mpe_ui_render(mpe_ui *u, const mp_target *t,
             const int ch_idx = (slot >= 0 ? c->fingers[slot].ch : 0);
             const rgb col = kChannelColor[ch_idx & 0x0F];
 
-            /* Pressure (size) gently scales the outer halo, capped
-               so the dirty-rect margin always wins. */
+            /* Pressure → radius. GT911 strength is the contact-area
+               proxy. Floor radius 16 px so a light tap is still
+               obviously a dot; ceiling 32 px so the dirty-rect
+               margin (44 px below) always provably covers the
+               drawn pixels. */
             const int z = p->strength;
-            int outer = 38 + (z > 0 ? z / 8 : 0);
-            if (outer > 58) outer = 58;
+            int radius = 16 + (z * 16 / 80);
+            if (radius < 16) radius = 16;
+            if (radius > 32) radius = 32;
 
-            mp_glow_add(t, p->x, p->y, outer,
-                        col.r, col.g, col.b);
-            mp_fill_circle_soft(t, p->x, p->y, 10,
-                                col.r, col.g, col.b, 220);
-            mp_fill_circle_soft(t, p->x, p->y, 4,
-                                0xff, 0xff, 0xff, 200);
+            mp_fill_circle(t, p->x, p->y, radius,
+                           mp_rgb565(col.r, col.g, col.b));
+            /* Small white centre to mark the exact touch point. */
+            mp_fill_circle(t, p->x, p->y, radius / 4 + 2,
+                           mp_rgb565(0xff, 0xff, 0xff));
         }
     }
 

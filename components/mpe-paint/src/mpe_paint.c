@@ -213,6 +213,27 @@ void mp_fill_circle_soft(const mp_target *t, int cx, int cy, int radius,
     }
 }
 
+void mp_fill_circle(const mp_target *t, int cx, int cy, int radius,
+                    uint16_t color)
+{
+    if (!t || !t->fb || radius <= 0) return;
+    const int r2 = radius * radius;
+
+    int y0 = cy - radius; if (y0 < 0) y0 = 0;
+    int y1 = cy + radius; if (y1 >= t->height) y1 = t->height - 1;
+
+    for (int yy = y0; yy <= y1; yy++) {
+        const int dy = yy - cy;
+        const int dy2 = dy * dy;
+        if (dy2 > r2) continue;
+        const int dx_max = isqrt32(r2 - dy2);
+        int x0 = cx - dx_max; if (x0 < 0) x0 = 0;
+        int x1 = cx + dx_max; if (x1 >= t->width) x1 = t->width - 1;
+        uint16_t *row = t->fb + (size_t)yy * t->width;
+        for (int xx = x0; xx <= x1; xx++) row[xx] = color;
+    }
+}
+
 void mp_glow_add(const mp_target *t, int cx, int cy, int radius,
                  uint8_t r, uint8_t g, uint8_t b)
 {
