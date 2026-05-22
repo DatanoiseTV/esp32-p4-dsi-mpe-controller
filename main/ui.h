@@ -32,11 +32,12 @@
 extern "C" {
 #endif
 
-#define MPE_UI_TRAIL_LEN 8     /* trail comet length; was 16. Halved
-                                  to cut particle cost without losing
-                                  the motion read; each point's
-                                  contribution decays fast enough that
-                                  the last 8 are barely visible. */
+#define MPE_UI_TRAIL_LEN 4     /* trail comet length. Each trail point
+                                  is a mp_glow_add call with per-pixel
+                                  blend; the 5th+ points decayed below
+                                  the drawing threshold most of the
+                                  time anyway. 4 keeps the visible
+                                  motion read but halves the work. */
 
 /* The status bar is two stacked rows of 36 px each (button row +
    status row). 72 px total — the single source of truth for ui_y. */

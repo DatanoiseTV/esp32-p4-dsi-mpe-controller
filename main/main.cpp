@@ -845,7 +845,28 @@ extern "C" void app_main(void)
 
         mpe_ui_render(&ui, &target, &snap_ctrl, &snap_tf, &st);
 
-        mpe_display_present();
+        /* Compute the dirty Y band — union of every rect we
+           restored + drew on top of this frame. Flushing only
+           those rows saves significant time vs full-FB flush
+           under chord load (5 fingers wrote ~half the screen,
+           full flush was wasting cycles on the other half). */
+        int y_min = MPE_DISPLAY_HEIGHT, y_max = 0;
+        const dirty_list_t *prev_for_flush = &s_prev_dirty[s_back_local];
+        for (int i = 0; i < prev_for_flush->n; i++) {
+            const rect_t *r = &prev_for_flush->r[i];
+            if (r->y < y_min) y_min = r->y;
+            if (r->y + r->h > y_max) y_max = r->y + r->h;
+        }
+        for (int i = 0; i < cur.n; i++) {
+            const rect_t *r = &cur.r[i];
+            if (r->y < y_min) y_min = r->y;
+            if (r->y + r->h > y_max) y_max = r->y + r->h;
+        }
+        if (y_max > y_min) {
+            mpe_display_present_y(y_min, y_max - y_min);
+        } else {
+            mpe_display_present();
+        }
 
         frames++;
         const int64_t now = esp_timer_get_time();

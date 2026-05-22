@@ -383,18 +383,24 @@ void mpe_display_flush_writes(void *buf, size_t bytes)
                     ESP_CACHE_MSYNC_FLAG_UNALIGNED);
 }
 
-esp_err_t mpe_display_present(void)
+esp_err_t mpe_display_present_y(int y0, int h)
 {
     if (!s_panel) return ESP_ERR_INVALID_STATE;
 
-    /* Flush CPU writes from cache → PSRAM so the DSI engine sees
-       the pixels we just painted. The initial draw_bitmap in init
-       starts scanout; subsequent presents queue buffer swaps. */
-    const size_t fb_bytes =
-        (size_t)MPE_DISPLAY_WIDTH * MPE_DISPLAY_HEIGHT * 2;
-    esp_cache_msync(s_fbs[s_back_idx], fb_bytes,
-                    ESP_CACHE_MSYNC_FLAG_DIR_C2M |
-                    ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    if (y0 < 0) { h += y0; y0 = 0; }
+    if (y0 + h > MPE_DISPLAY_HEIGHT) h = MPE_DISPLAY_HEIGHT - y0;
+    if (h <= 0) {
+        /* Nothing dirty in this frame — still need to draw_bitmap
+           to keep the swap chain ticking, but no flush needed. */
+    } else {
+        const size_t row_bytes = (size_t)MPE_DISPLAY_WIDTH * 2;
+        uint8_t *start = (uint8_t *)s_fbs[s_back_idx] +
+                         (size_t)y0 * row_bytes;
+        size_t   span  = (size_t)h * row_bytes;
+        esp_cache_msync(start, span,
+                        ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+                        ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    }
 
     esp_err_t err = esp_lcd_panel_draw_bitmap(
         s_panel, 0, 0,
@@ -404,15 +410,12 @@ esp_err_t mpe_display_present(void)
         ESP_LOGW(TAG, "draw_bitmap failed: %s", esp_err_to_name(err));
         return err;
     }
-
-    /* No explicit vsync wait: neither on_refresh_done nor
-       on_color_trans_done fires reliably on this EK79007 + IDF v6.0
-       combination, and a timeout-bound wait pins FPS at 10. The
-       panel driver internally serialises back-to-back draw_bitmap
-       calls behind the in-flight scanout, so presents naturally
-       pace to the refresh rate — at the cost of occasional tearing
-       on individual frames if rendering races the swap. */
-
     s_back_idx ^= 1;
     return ESP_OK;
+}
+
+esp_err_t mpe_display_present(void)
+{
+    /* Full-FB flush — for callers that don't track dirty Y. */
+    return mpe_display_present_y(0, MPE_DISPLAY_HEIGHT);
 }
