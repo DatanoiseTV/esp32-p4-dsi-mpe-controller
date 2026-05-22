@@ -317,17 +317,17 @@ void mpe_display_rect_copy(uint16_t *dst, const uint16_t *src,
     /* Invalidate cache lines for the rect rows so subsequent CPU
        reads of `dst` see what PPA just wrote (and not stale lines
        from 2 frames ago, which is what produced the "fill bug"
-       smearing in alpha-blend overlays). One contiguous range
-       covering h full rows — esp_cache_msync handles partial-line
-       endpoints with the UNALIGNED flag. */
+       smearing in alpha-blend overlays).
+       The range is naturally cache-line aligned — each row is
+       MPE_DISPLAY_WIDTH * 2 = 2048 B = exactly 32 cache lines on the
+       P4 — so we can call M2C without the UNALIGNED flag, which the
+       IDF doesn't permit for M2C anyway. */
     {
         const size_t row_bytes = (size_t)MPE_DISPLAY_WIDTH * 2;
         uint8_t *p = (uint8_t *)dst + (size_t)y * row_bytes;
         const size_t span = (size_t)h * row_bytes;
         (void)fb_bytes;
-        esp_cache_msync(p, span,
-                        ESP_CACHE_MSYNC_FLAG_DIR_M2C |
-                        ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+        esp_cache_msync(p, span, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
     }
 }
 

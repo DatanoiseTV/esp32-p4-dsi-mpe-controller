@@ -208,19 +208,22 @@ void mpe_ui_render(mpe_ui *u, const mp_target *t,
             char line1[12], line2[24];
             snprintf(line1, sizeof line1, "%s%d",
                      kNN[f->note % 12], oct);
-            const float bend = ((float)f->last_pb - 8192.0f) / 8192.0f;
-            snprintf(line2, sizeof line2, "ch%d  %+0.2f",
-                     f->ch + 1, (double)bend);
+            /* Compact "ch · z%" — the live pitch bend gets its own
+               visual bar at the bottom of the chip (below), so the
+               second text line can stay short. */
+            const int z_pct = (int)(f->z * 100.0f + 0.5f);
+            snprintf(line2, sizeof line2, "ch%d  z%d%%",
+                     f->ch + 1, z_pct);
 
-            const int sz1 = 20, sz2 = 12;
+            const int sz1 = 18, sz2 = 11;
+            const int bar_h = 4;
             const int w1 = mpe_font_text_width_px(line1, -1, sz1);
             const int w2 = mpe_font_text_width_px(line2, -1, sz2);
-            const int chip_w = (w1 > w2 ? w1 : w2) + 14;
-            const int chip_h = sz1 + sz2 + 8;
+            const int inner_w = (w1 > w2 ? w1 : w2);
+            const int chip_w = (inner_w < 56 ? 56 : inner_w) + 14;
+            const int chip_h = sz1 + sz2 + bar_h + 10;
 
-            /* Prefer above the finger; flip below if it'd clip the
-               top bar. */
-            int cy = fy - 36 - chip_h;
+            int cy = fy - 32 - chip_h;
             if (cy < c->cfg.ui_y + 4) cy = fy + 40;
             int cx = fx - chip_w / 2;
             if (cx < 4) cx = 4;
@@ -230,23 +233,50 @@ void mpe_ui_render(mpe_ui *u, const mp_target *t,
 
             /* Translucent backdrop tinted by channel — readable over
                busy backgrounds, ties the chip to the finger glow. */
-            mp_fill_rect_a(t, cx, cy, chip_w, chip_h, 0x06, 0x09, 0x14, 215);
+            mp_fill_rect_a(t, cx, cy, chip_w, chip_h,
+                           0x06, 0x09, 0x14, 220);
             mp_hline_a(t, cx, cy,              chip_w,
-                       col.r, col.g, col.b, 110);
+                       col.r, col.g, col.b, 120);
             mp_hline_a(t, cx, cy + chip_h - 1, chip_w,
-                       0, 0, 0, 160);
+                       0, 0, 0, 170);
             mp_vline_a(t, cx,              cy, chip_h,
-                       col.r, col.g, col.b, 60);
-            mp_vline_a(t, cx + chip_w - 1, cy, chip_h, 0, 0, 0, 60);
+                       col.r, col.g, col.b, 70);
+            mp_vline_a(t, cx + chip_w - 1, cy, chip_h, 0, 0, 0, 70);
 
             mpe_font_draw_text(t->fb, t->width, t->height,
                                cx + (chip_w - w1) / 2, cy + 3,
                                line1, -1, sz1,
                                mp_rgb565(0xf4, 0xf6, 0xff));
             mpe_font_draw_text(t->fb, t->width, t->height,
-                               cx + (chip_w - w2) / 2, cy + 3 + sz1 + 1,
+                               cx + (chip_w - w2) / 2, cy + 3 + sz1,
                                line2, -1, sz2,
                                mp_rgb565(col.r, col.g, col.b));
+
+            /* Pitch-bend bar at the bottom of the chip. A centred
+               rail with a notch on the rest-position, and a bar
+               extending left or right from centre by |bend|. This
+               is what the synth sees, drawn the way a pitch-bend
+               wheel reads. */
+            const int bar_y = cy + chip_h - bar_h - 3;
+            const int bar_inset = 6;
+            const int bar_w = chip_w - 2 * bar_inset;
+            const int bar_cx = cx + bar_inset + bar_w / 2;
+            /* dim rail */
+            mp_fill_rect_a(t, cx + bar_inset, bar_y, bar_w, bar_h,
+                           0x18, 0x1c, 0x28, 200);
+            /* rest-position notch */
+            mp_vline_a(t, bar_cx, bar_y - 1, bar_h + 2,
+                       0x40, 0x48, 0x58, 220);
+            /* live bend bar */
+            const float bend = ((float)f->last_pb - 8192.0f) / 8192.0f;
+            int bend_px = (int)(bend * (float)(bar_w / 2));
+            if (bend_px > 0) {
+                mp_fill_rect_a(t, bar_cx, bar_y, bend_px, bar_h,
+                               col.r, col.g, col.b, 230);
+            } else if (bend_px < 0) {
+                mp_fill_rect_a(t, bar_cx + bend_px, bar_y, -bend_px, bar_h,
+                               col.r, col.g, col.b, 230);
+            }
         }
     }
 
@@ -279,29 +309,56 @@ void mpe_ui_render(mpe_ui *u, const mp_target *t,
             return tx;
         };
 
-        char tmp[64];
+        /* Helper: extract :port from "host:port" string, return -1
+           if there's no colon. Keeps the status row narrow by
+           dropping the peer IP (it's a Kconfig constant; the dot
+           colour already says "configured + reachable"). */
+        auto port_of = [](const char *s) -> int {
+            if (!s) return -1;
+            const char *colon = NULL;
+            for (const char *p = s; *p; p++) if (*p == ':') colon = p;
+            if (!colon) return -1;
+            int v = 0;
+            for (const char *p = colon + 1; *p >= '0' && *p <= '9'; p++) {
+                v = v * 10 + (*p - '0');
+            }
+            return v;
+        };
+
+        char tmp[48];
         int x = 14;
+
+        /* WiFi: shows our station IP — the one piece of network
+           identity the user can't infer from build config. */
         snprintf(tmp, sizeof tmp, "%s",
                  st->wifi_ip && st->wifi_ip[0] ? st->wifi_ip : "—");
         x = chip(x, "WiFi", tmp,
                  st->wifi_ip && st->wifi_ip[0],
                  (rgb){0x44, 0xff, 0x88});
-        x += 22;
+        x += 24;
 
-        if (st->midi_rtt_ms > 0) {
-            snprintf(tmp, sizeof tmp, "%s  (%d ms)",
-                     st->midi_peer ? st->midi_peer : "—",
-                     st->midi_rtt_ms);
+        /* MIDI: just the port + live RTT. Peer IP is in menuconfig. */
+        const int midi_port = port_of(st->midi_peer);
+        if (st->midi_rtt_ms > 0 && midi_port > 0) {
+            snprintf(tmp, sizeof tmp, "%d  %dms", midi_port, st->midi_rtt_ms);
+        } else if (midi_port > 0) {
+            snprintf(tmp, sizeof tmp, "%d", midi_port);
         } else {
-            snprintf(tmp, sizeof tmp, "%s",
-                     st->midi_peer ? st->midi_peer : "—");
+            snprintf(tmp, sizeof tmp, "%s", st->midi_peer ? st->midi_peer : "—");
         }
         x = chip(x, "MIDI", tmp, st->midi_connected,
                  (rgb){0xff, 0xaa, 0x33});
-        x += 22;
+        x += 24;
 
-        x = chip(x, "OSC",
-                 st->osc_peer && st->osc_peer[0] ? st->osc_peer : "—",
+        /* OSC: just the port. */
+        const int osc_port = port_of(st->osc_peer);
+        if (osc_port > 0) {
+            snprintf(tmp, sizeof tmp, "%d", osc_port);
+        } else {
+            snprintf(tmp, sizeof tmp, "%s",
+                     st->osc_peer && st->osc_peer[0] ? st->osc_peer : "—");
+        }
+        x = chip(x, "OSC", tmp,
                  st->osc_peer && st->osc_peer[0],
                  (rgb){0x88, 0xaa, 0xff});
 

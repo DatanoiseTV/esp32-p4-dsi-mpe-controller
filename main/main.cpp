@@ -442,10 +442,14 @@ extern "C" void app_main(void)
     }
 
     /* 5. OSC. */
+    static char osc_peer_str[48] = "";
     if (wifi_ok && strlen(CONFIG_MPE_OSC_HOST) > 0) {
         g_osc = mpe_osc_client_new(CONFIG_MPE_OSC_HOST, CONFIG_MPE_OSC_PORT);
-        if (g_osc) ESP_LOGI(TAG, "OSC → %s:%d",
-                            CONFIG_MPE_OSC_HOST, CONFIG_MPE_OSC_PORT);
+        if (g_osc) {
+            snprintf(osc_peer_str, sizeof osc_peer_str, "%s:%d",
+                     CONFIG_MPE_OSC_HOST, CONFIG_MPE_OSC_PORT);
+            ESP_LOGI(TAG, "OSC → %s", osc_peer_str);
+        }
     }
 
     /* 6. AppleMIDI. */
@@ -686,17 +690,19 @@ extern "C" void app_main(void)
                 any = true;
             }
             if (!any) continue;
-            /* Vertical safety: the per-finger floating label chip
-               sits up to 64 px ABOVE the touch (or below, near the
-               bottom edge — but we'd rather over-cover and keep the
-               dirty rect simple). 80 px of vertical slop covers both
-               cases and keeps the rect a single rectangle. */
-            const int label_extra_top = 80;
+            /* The per-finger floating chip is placed ABOVE the touch
+               point by default, but flips BELOW when too close to
+               the top bar. Either case extends ~75 px past the
+               finger glow, so we pad both Y sides symmetrically.
+               Without the symmetric pad, the chip below a near-top
+               touch would leak past the next frame's restore and
+               leave a ghost. */
+            const int label_extra = 80;
             dirty_push(&cur,
                        min_x - glow_margin,
-                       min_y - glow_margin - label_extra_top,
+                       min_y - glow_margin - label_extra,
                        (max_x - min_x) + 2 * glow_margin,
-                       (max_y - min_y) + 2 * glow_margin + label_extra_top);
+                       (max_y - min_y) + 2 * glow_margin + 2 * label_extra);
         }
         /* Latest-touch positions may be slightly ahead of the
            controller snapshot — include them too so the glow drawn
@@ -720,7 +726,7 @@ extern "C" void app_main(void)
         st.midi_peer      = midi_peer_str;
         st.midi_rtt_ms    = mpe_applemidi_latency_ms();
         st.midi_connected = mpe_applemidi_connected();
-        st.osc_peer       = (g_osc ? CONFIG_MPE_OSC_HOST : "");
+        st.osc_peer       = (g_osc ? osc_peer_str : "");
         st.fps            = fps_disp;
         st.active_fingers = s_active_fingers.load(std::memory_order_relaxed);
 

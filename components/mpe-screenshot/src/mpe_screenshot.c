@@ -93,9 +93,10 @@ static esp_err_t screenshot_get_handler(httpd_req_t *req)
         httpd_resp_send_chunk(req, NULL, 0);
         return ESP_FAIL;
     }
-    esp_cache_msync(fb, FB_BYTES,
-                    ESP_CACHE_MSYNC_FLAG_DIR_M2C |
-                    ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    /* FB pointer is at the start of a panel-driver allocation
+       (64-byte aligned) and FB_BYTES = 1228800 = multiple of 64,
+       so no UNALIGNED flag needed (IDF rejects it for M2C anyway). */
+    esp_cache_msync(fb, FB_BYTES, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
 
     /* Chunked send so we don't need a full FB_BYTES buffer in RAM.
        64 KiB chunks: comfortably under any LWIP send queue limit, and
