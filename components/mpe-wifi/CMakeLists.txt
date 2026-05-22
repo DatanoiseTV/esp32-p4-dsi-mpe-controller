@@ -7,4 +7,5 @@ idf_component_register(
         esp_netif
         esp_hosted
         nvs_flash
-        log)
+        log
+)

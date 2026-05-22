@@ -9,6 +9,7 @@ idf_component_register(
         esp_psram
         esp_timer
         esp_netif
+        nvs_flash
         lwip
         mpe-display
         mpe-touch

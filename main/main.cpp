@@ -48,6 +48,7 @@ extern "C" {
 #include "mpe_osc.h"
 #include "mpe_applemidi.h"
 #include "mpe_screenshot.h"
+#include "nvs_flash.h"
 }
 
 #include "ui.h"
@@ -64,6 +65,13 @@ mpe_osc_client *g_osc = nullptr;
 /* --- Shared state between touch + render tasks ---------------------- */
 static mpe_controller         s_ctrl;
 static std::atomic<int>       s_active_fingers{0};
+/* When a finger releases, the touch task bumps this counter. The
+   render task drains it by doing a FULL template→back-buffer
+   memcpy on the next N frames instead of partial-restore. Brute-
+   force backstop against any partial-restore corner case that
+   could leave a "frozen mid-movement" ghost on the buffers (the
+   user-reported "going back between 2 frames" symptom). */
+static std::atomic<int>       s_force_full_restore{0};
 static mpe_touch_frame        s_latest_tf;
 
 /* --- Static template (pre-rendered background + grid + labels) ---- */
@@ -400,6 +408,9 @@ static void render_template(uint16_t *fb,
         case MPE_BTN_CYCLE_ROOT:
             draw_button_chip(&t, b, "Root", mpe_controller_root_name(c));
             break;
+        case MPE_BTN_CYCLE_PB:
+            draw_button_chip(&t, b, "Bend", mpe_controller_pb_label(c));
+            break;
         case MPE_BTN_ROW0_OCT_DOWN: draw_button_step(&t, b, "<"); r1_dn = b; break;
         case MPE_BTN_ROW0_OCT_UP:   draw_button_step(&t, b, ">"); r1_up = b; break;
         case MPE_BTN_ROW1_OCT_DOWN: draw_button_step(&t, b, "<"); r2_dn = b; break;
@@ -451,6 +462,7 @@ static void touch_task(void *arg)
     const TickType_t period = pdMS_TO_TICKS(4);
     TickType_t next = xTaskGetTickCount();
     int64_t prev_us = esp_timer_get_time();
+    int     prev_active = 0;
     while (true) {
         mpe_touch_frame tf = {};
         mpe_touch_poll(&tf);
@@ -466,6 +478,16 @@ static void touch_task(void *arg)
         mpe_controller_unlock(&s_ctrl);
         s_active_fingers.store(active, std::memory_order_relaxed);
 
+        /* Did any finger just release? Trigger a multi-frame full
+           clean on the renderer so any leftover mid-movement
+           pixels on either buffer get fully replaced with template
+           content. 4 frames covers worst-case double-buffer +
+           1-frame snap latency margins. */
+        if (active < prev_active) {
+            s_force_full_restore.store(4, std::memory_order_release);
+        }
+        prev_active = active;
+
         vTaskDelayUntil(&next, period);
     }
 }
@@ -475,6 +497,20 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "boot — heap free: %zu int / %zu psram",
              heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    /* Initialise NVS early — the controller persists scale/root/PB/
+       octave settings here, and we want them loaded before the
+       splash so the keyboard template reflects the last session. */
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_err = nvs_flash_init();
+    }
+    if (nvs_err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS init failed (%s) — settings won't persist",
+                 esp_err_to_name(nvs_err));
+    }
 
     /* 1. Display. */
     if (mpe_display_init() != ESP_OK) {
@@ -593,41 +629,42 @@ extern "C" void app_main(void)
     {
         const int16_t by = MPE_UI_BTN_Y;
         const int16_t bh = MPE_UI_BTN_H;
-        const int16_t chip_w = 116;
-        const int16_t step_w = 30;
-        const int16_t row_label_w = 52;  /* "R1 +0" caption between steppers */
-        const int16_t inter_chip = 8;
-        const int16_t inter_step = 4;
-        const int16_t inter_group = 22;
-        const int16_t title_w = 210;     /* big "MPE / controller" title */
+        const int16_t chip_w = 96;        /* chips slimmer to fit PB */
+        const int16_t pb_chip_w = 80;
+        const int16_t step_w = 28;
+        const int16_t row_label_w = 46;
+        const int16_t inter_chip = 6;
+        const int16_t inter_step = 3;
+        const int16_t inter_group = 14;
+        const int16_t title_w = 210;
 
         int16_t x = title_w;
         const int16_t x_scale  = x;
         x += chip_w + inter_chip;
         const int16_t x_root   = x;
-        x += chip_w + inter_group;
+        x += chip_w + inter_chip;
+        const int16_t x_pb     = x;
+        x += pb_chip_w + inter_group;
 
         const int16_t x_r1_dn  = x;
         x += step_w + inter_step;
-        const int16_t x_r1_lbl = x;  /* drawn as static label, not a button */
         x += row_label_w + inter_step;
         const int16_t x_r1_up  = x;
         x += step_w + inter_group;
 
         const int16_t x_r2_dn  = x;
         x += step_w + inter_step;
-        const int16_t x_r2_lbl = x;
-        (void)x_r1_lbl; (void)x_r2_lbl;
         x += row_label_w + inter_step;
         const int16_t x_r2_up  = x;
 
         const mpe_button btns[] = {
-            { x_scale,  by, chip_w, bh, MPE_BTN_CYCLE_SCALE   },
-            { x_root,   by, chip_w, bh, MPE_BTN_CYCLE_ROOT    },
-            { x_r1_dn,  by, step_w, bh, MPE_BTN_ROW0_OCT_DOWN },
-            { x_r1_up,  by, step_w, bh, MPE_BTN_ROW0_OCT_UP   },
-            { x_r2_dn,  by, step_w, bh, MPE_BTN_ROW1_OCT_DOWN },
-            { x_r2_up,  by, step_w, bh, MPE_BTN_ROW1_OCT_UP   },
+            { x_scale,  by, chip_w,    bh, MPE_BTN_CYCLE_SCALE   },
+            { x_root,   by, chip_w,    bh, MPE_BTN_CYCLE_ROOT    },
+            { x_pb,     by, pb_chip_w, bh, MPE_BTN_CYCLE_PB      },
+            { x_r1_dn,  by, step_w,    bh, MPE_BTN_ROW0_OCT_DOWN },
+            { x_r1_up,  by, step_w,    bh, MPE_BTN_ROW0_OCT_UP   },
+            { x_r2_dn,  by, step_w,    bh, MPE_BTN_ROW1_OCT_DOWN },
+            { x_r2_up,  by, step_w,    bh, MPE_BTN_ROW1_OCT_UP   },
         };
         mpe_controller_set_buttons(&s_ctrl, btns,
                                    sizeof btns / sizeof btns[0]);
@@ -820,11 +857,30 @@ extern "C" void app_main(void)
                        r->w + 8, r->h + 8);
         }
 
-        /* Restore both lists (previous frame this buffer + current).
-           Some pixels get touched twice — fine, the copy is idempotent. */
+        /* If the touch task signalled a recent release, force a
+           full template→back memcpy for the next few frames. This
+           guarantees both alternating buffers see a fully-clean
+           paint and any stale mid-movement pixels get wiped — the
+           user-reported "going back between 2 frames" symptom. */
         const dirty_list_t *prev = &s_prev_dirty[s_back_local];
-        for (int i = 0; i < prev->n; i++) restore_rect_(back, s_template, prev->r[i]);
-        for (int i = 0; i < cur.n;  i++) restore_rect_(back, s_template, cur.r[i]);
+        int forced = s_force_full_restore.load(std::memory_order_acquire);
+        bool full_restore_this_frame = (forced > 0);
+        if (full_restore_this_frame) {
+            memcpy(back, s_template, kFbBytes);
+            s_force_full_restore.store(forced - 1, std::memory_order_release);
+            /* Mark this buffer's whole area as the saved dirty for
+               the next pass through, so the partial-restore chain
+               picks up cleanly after the burst ends. */
+            dirty_list_t full = {};
+            dirty_push(&full, 0, 0, MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT);
+            s_prev_dirty[s_back_local] = full;
+        } else {
+            /* Restore both lists (previous frame on this buffer +
+               current). Some pixels get touched twice — fine, the
+               copy is idempotent. */
+            for (int i = 0; i < prev->n; i++) restore_rect_(back, s_template, prev->r[i]);
+            for (int i = 0; i < cur.n;  i++) restore_rect_(back, s_template, cur.r[i]);
+        }
 
         mpe_ui_status st = {};
         st.wifi_ip        = wifi_ip;
@@ -854,7 +910,10 @@ extern "C" void app_main(void)
             if (r->y < y_min) y_min = r->y;
             if (r->y + r->h > y_max) y_max = r->y + r->h;
         }
-        if (y_max > y_min) {
+        if (full_restore_this_frame) {
+            /* Full FB was touched — full-FB flush. */
+            mpe_display_present();
+        } else if (y_max > y_min) {
             mpe_display_present_y(y_min, y_max - y_min);
         } else {
             mpe_display_present();

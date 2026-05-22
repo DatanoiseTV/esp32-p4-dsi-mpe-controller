@@ -90,6 +90,7 @@ typedef enum {
     MPE_BTN_NONE = 0,
     MPE_BTN_CYCLE_SCALE,
     MPE_BTN_CYCLE_ROOT,
+    MPE_BTN_CYCLE_PB,         /* pitch-bend range: 1 / 4 / 12 / 48 semis */
     MPE_BTN_ROW0_OCT_DOWN,
     MPE_BTN_ROW0_OCT_UP,
     MPE_BTN_ROW1_OCT_DOWN,
@@ -157,6 +158,10 @@ typedef struct {
     mpe_scale_id       scale;
     int                root_pc;            /* 0..11 */
     int                row_oct_shift[MPE_MAX_ROWS];
+    int                pb_range_live;      /* current PB range in semis;
+                                              cycled by the on-screen PB
+                                              button. Initialised from
+                                              cfg.pb_range_semitones. */
 
     /* Bumped whenever any of the above changes so the renderer
        knows to rebake the static template. */
@@ -187,6 +192,7 @@ void mpe_controller_set_buttons(mpe_controller *c,
 /* Returns the human-readable name of the current scale. */
 const char *mpe_controller_scale_name(const mpe_controller *c);
 const char *mpe_controller_root_name (const mpe_controller *c);
+const char *mpe_controller_pb_label  (const mpe_controller *c);
 
 /* Re-build the keyboard with current scale/root/octave shifts. Bumps
    layout_version. Cheap (only the keys[] array is touched). */

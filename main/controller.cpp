@@ -23,9 +23,55 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
 #include "mpe_applemidi.h"
 #include "mpe_osc.h"
+
+/* NVS namespace + keys for persisted on-screen settings. */
+#define MPE_NVS_NS "mpe"
+
+static void persist_state_(const mpe_controller *c)
+{
+    nvs_handle_t h;
+    if (nvs_open(MPE_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, "scale",    (uint8_t)c->scale);
+    nvs_set_u8(h, "root_pc",  (uint8_t)c->root_pc);
+    nvs_set_u8(h, "pb_range", (uint8_t)c->pb_range_live);
+    nvs_set_i8(h, "r0_oct",   (int8_t)c->row_oct_shift[0]);
+    nvs_set_i8(h, "r1_oct",   (int8_t)c->row_oct_shift[1]);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void load_state_(mpe_controller *c)
+{
+    nvs_handle_t h;
+    if (nvs_open(MPE_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t u8;
+    int8_t  i8;
+    if (nvs_get_u8(h, "scale", &u8) == ESP_OK && u8 < MPE_NUM_SCALES) {
+        c->scale = (mpe_scale_id)u8;
+    }
+    if (nvs_get_u8(h, "root_pc", &u8) == ESP_OK && u8 < 12) {
+        c->root_pc = u8;
+    }
+    if (nvs_get_u8(h, "pb_range", &u8) == ESP_OK) {
+        /* Accept only the values cycled by the on-screen button so we
+           never end up with a value the UI can't represent. */
+        if (u8 == 1 || u8 == 4 || u8 == 12 || u8 == 48) {
+            c->pb_range_live = u8;
+        }
+    }
+    if (nvs_get_i8(h, "r0_oct", &i8) == ESP_OK && i8 >= -3 && i8 <= 3) {
+        c->row_oct_shift[0] = i8;
+    }
+    if (nvs_get_i8(h, "r1_oct", &i8) == ESP_OK && i8 >= -3 && i8 <= 3) {
+        c->row_oct_shift[1] = i8;
+    }
+    nvs_close(h);
+}
 
 extern mpe_osc_client *g_osc;
 static const char *TAG = "ctrl";
@@ -66,6 +112,17 @@ const char *mpe_controller_scale_name(const mpe_controller *c)
 { return k_scale_names[c->scale]; }
 const char *mpe_controller_root_name (const mpe_controller *c)
 { return k_note_names[c->root_pc]; }
+
+const char *mpe_controller_pb_label(const mpe_controller *c)
+{
+    switch (c->pb_range_live) {
+    case 1:  return "1 st";
+    case 4:  return "2 t";    /* two whole-tones = 4 semis */
+    case 12: return "octv";
+    case 48: return "48 st";
+    default: return "?";
+    }
+}
 
 /* ---- keyboard build ---------------------------------------------- */
 
@@ -158,8 +215,17 @@ void mpe_controller_init(mpe_controller *c, const mpe_controller_cfg *cfg)
     init_velocity_curve_();
     c->scale          = MPE_SCALE_CHROMATIC;
     c->root_pc        = 0;
+    c->pb_range_live  = cfg->pb_range_semitones;
     c->layout_version = 0;
     for (int i = 0; i < MPE_MAX_ROWS; i++) c->row_oct_shift[i] = 0;
+
+    /* Pull persisted settings — scale, root, PB range, octave
+       shifts — from NVS if they were saved previously. Falls back to
+       the defaults above if no entry exists. */
+    load_state_(c);
+    ESP_LOGI(TAG, "loaded settings: scale=%d root=%d pb=%d r0=%d r1=%d",
+             c->scale, c->root_pc, c->pb_range_live,
+             c->row_oct_shift[0], c->row_oct_shift[1]);
     for (int i = 0; i < MPE_CTRL_MAX_FINGERS; i++) {
         c->fingers[i].active      = false;
         c->fingers[i].tracking_id = -1;
@@ -222,6 +288,29 @@ bool mpe_controller_apply_button(mpe_controller *c, mpe_btn_action a)
     case MPE_BTN_CYCLE_ROOT:
         c->root_pc = (c->root_pc + 1) % 12;
         break;
+    case MPE_BTN_CYCLE_PB: {
+        /* 1 semitone → 4 (two tones) → 12 (octave) → 48 (wide MPE)
+           and back. After cycling, re-publish the per-channel
+           pitch-bend RPN to every member channel so the synth's
+           scaling matches what we're now sending. */
+        int next;
+        switch (c->pb_range_live) {
+        case 1:  next = 4;  break;
+        case 4:  next = 12; break;
+        case 12: next = 48; break;
+        default: next = 1;  break;
+        }
+        c->pb_range_live = next;
+        for (int ch = c->cfg.member_lo; ch <= c->cfg.member_hi; ch++) {
+            mpe_applemidi_send_pb_range((uint8_t)ch, (uint8_t)next);
+        }
+        /* No keyboard rebuild needed for PB — but the chip label
+           changed, so bump layout_version so the template re-bakes
+           and the new value appears on screen. */
+        c->layout_version++;
+        persist_state_(c);
+        return true;
+    }
     case MPE_BTN_ROW0_OCT_DOWN:
         if (c->row_oct_shift[0] > -3) c->row_oct_shift[0]--;
         break;
@@ -238,6 +327,7 @@ bool mpe_controller_apply_button(mpe_controller *c, mpe_btn_action a)
         return false;
     }
     mpe_controller_rebuild_keyboard(c);
+    persist_state_(c);
     return true;
 }
 
@@ -280,7 +370,10 @@ static uint16_t pb_from_displacement(const mpe_controller *c,
 {
     const float key_w = (float)c->kb.white_w[clampi(row, 0, MPE_MAX_ROWS - 1)];
     const float bend_semis = (float)dx_px / key_w;
-    const float bend_norm  = bend_semis / (float)c->cfg.pb_range_semitones;
+    /* Live range from the on-screen PB cycle button, not cfg.
+       Smaller range = same finger motion produces bigger 14-bit
+       deltas = host pitch bends more aggressively. */
+    const float bend_norm  = bend_semis / (float)c->pb_range_live;
     int v = 0x2000 + (int)(bend_norm * 8192.0f);
     return (uint16_t)clampi(v, 0, 0x3FFF);
 }
@@ -488,22 +581,43 @@ int mpe_controller_update(mpe_controller *c, const mpe_touch_frame *f)
         if (!fg->active) continue;
         if (seen[i]) { active++; continue; }
 
-        /* Stamp the finger's last touched key into the residual
-           cleanup queue so the renderer keeps restoring that area
-           for the next ~200 ms across both buffers. Without this,
-           a borderline-timed release leaves an alpha-blended halo
-           in the framebuffer that the normal dirty-rect chain
-           somehow misses. */
+        /* Stamp the finger's last visible area into the residual
+           queue so the renderer keeps restoring it for the next
+           ~250 ms across both buffers.
+           CRITICAL: this rect must cover BOTH the key (where the
+           activity halo lived) AND the finger dot's drawn pixel
+           area. The dot is centred on the touch position, which
+           can be 30+ px above or below the key boundary (top/
+           bottom of the playable surface) — leaving the dot's
+           overflow out of the residual was exactly why we saw
+           "half circle stuck" after-release ghosts in the screenshot.
+           The bounding box of (key_rect) ∪ (touch_pos ± 50) covers
+           the worst-case dot drawing for any finger. */
         if (!fg->is_ui &&
             fg->key_idx >= 0 && fg->key_idx < c->kb.n_keys &&
             c->n_residual < MPE_RESIDUAL_CAP) {
             const mpe_key *k = &c->kb.keys[fg->key_idx];
+            const int fpx = c->cfg.ui_x +
+                            (int)(fg->x_norm * (float)c->cfg.ui_w);
+            const int fpy = c->cfg.ui_y +
+                            (int)((1.0f - fg->y_norm) * (float)c->cfg.ui_h);
+            const int dot_margin = 50;   /* > max dot radius (32) + safety */
+
+            int rx = k->x;
+            int ry = k->y;
+            int r_right  = k->x + k->w;
+            int r_bottom = k->y + k->h;
+            if (fpx - dot_margin < rx) rx = fpx - dot_margin;
+            if (fpy - dot_margin < ry) ry = fpy - dot_margin;
+            if (fpx + dot_margin > r_right)  r_right  = fpx + dot_margin;
+            if (fpy + dot_margin > r_bottom) r_bottom = fpy + dot_margin;
+
             mpe_residual_dirty *r = &c->residual[c->n_residual++];
-            r->x = k->x;
-            r->y = k->y;
-            r->w = k->w;
-            r->h = k->h;
-            r->expire_us = now + 200000;
+            r->x = (int16_t)rx;
+            r->y = (int16_t)ry;
+            r->w = (int16_t)(r_right - rx);
+            r->h = (int16_t)(r_bottom - ry);
+            r->expire_us = now + 250000;
         }
 
         if (!fg->is_ui) {
