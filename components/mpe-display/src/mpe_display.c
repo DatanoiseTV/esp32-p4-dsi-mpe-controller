@@ -347,10 +347,17 @@ void mpe_display_flush_writes(void *buf, size_t bytes)
 
 esp_err_t mpe_display_present(void)
 {
-    if (!s_panel || !s_vsync_sem) return ESP_ERR_INVALID_STATE;
+    if (!s_panel) return ESP_ERR_INVALID_STATE;
 
-    /* Queue the swap. The EK79007 driver flips its DMA scanout source
-       to the buffer we just painted on the next refresh boundary. */
+    /* Queue the swap. The EK79007 driver flips its DMA scanout
+       source to the buffer we just painted; subsequent draw_bitmap
+       calls naturally serialise behind the in-flight scanout, so
+       back-to-back presents are paced to the refresh rate without
+       us touching a semaphore.
+       The on_refresh_done / on_color_trans_done callbacks were
+       expected to give us an explicit per-swap signal, but neither
+       fires on this panel + IDF v6.0 combination — every wait
+       hit the 100 ms safety timeout and pinned FPS at 10. */
     esp_err_t err = esp_lcd_panel_draw_bitmap(
         s_panel, 0, 0,
         MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT,
@@ -358,21 +365,6 @@ esp_err_t mpe_display_present(void)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "draw_bitmap failed: %s", esp_err_to_name(err));
         return err;
-    }
-
-    /* Drop any stale signal then wait for the next refresh-done.
-       The wait has a generous timeout: on a healthy 60 Hz panel the
-       callback fires every ~17 ms, so 100 ms is ~6× the worst-case
-       wait. If we time out it means the refresh-done callback never
-       fired (panel didn't actually start scanout, or the
-       on_refresh_done dispatcher is wedged) — we log it and continue
-       rather than deadlocking the entire app on startup. */
-    xSemaphoreTake(s_vsync_sem, 0);
-    if (xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(100)) != pdTRUE) {
-        static int s_warn = 0;
-        if ((s_warn++ % 60) == 0) {
-            ESP_LOGW(TAG, "vsync wait timed out — panel not refreshing?");
-        }
     }
 
     s_back_idx ^= 1;
