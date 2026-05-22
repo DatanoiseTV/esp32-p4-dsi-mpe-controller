@@ -388,22 +388,41 @@ int mpe_controller_update(mpe_controller *c, const mpe_touch_frame *f)
             fg->init_y_px   = p->y;
             fg->press_us    = now;
 
-            /* SNAP: pitch-bend centred at NoteOn — host hears the
-               exact pitch first, then bends as the finger slides. */
+            /* Strict MPE expression-reset → NoteOn order. Every
+               expression dimension is brought to a known state on
+               the member channel *before* the NoteOn so the host's
+               sound (filter, timbre, amp env) starts from a clean
+               slate even if the channel was previously occupied by
+               a finger that lifted weirdly. The MMA MPE spec
+               recommends this exact order. */
+            float xn, yn;
+            compute_norms(c, p->x, p->y, &xn, &yn);
+
+            /* (1) Pitch bend → centre. Subsequent glide updates ride
+                   from this anchor. */
             mpe_applemidi_pitch_bend((uint8_t)ch, 0x2000);
             fg->last_pb = 0x2000;
 
-            /* CC74 (Y / timbre) from screen-Y normalized — continuous
-               across the whole touch surface per MPE convention. */
-            float xn, yn;
-            compute_norms(c, p->x, p->y, &xn, &yn);
+            /* (2) CC74 (Y / timbre / "slide") → screen-Y absolute.
+                   Most MPE synths map this onto filter cutoff or a
+                   dedicated "timbre" macro. */
             uint8_t yv = (uint8_t)(yn * 127.0f);
             mpe_applemidi_cc((uint8_t)ch, 74, yv);
             fg->last_y_cc = yv;
+
+            /* (3) Channel pressure (Z / "press") → 0. Ongoing
+                   samples update from here. Some hosts route Z to
+                   amp envelope or volume; explicit zero avoids the
+                   filter snapping open from a stale value on
+                   channel re-use. */
+            mpe_applemidi_channel_pressure((uint8_t)ch, 0);
+            fg->last_z_cp = 0;
+
             fg->x_norm = xn;
             fg->y_norm = yn;
 
-            /* Strike velocity from contact area (or fixed via Kconfig). */
+            /* (4) NoteOn — strike velocity from contact area (or
+                   the Kconfig fixed value). */
             uint8_t vel = (c->cfg.fixed_velocity > 0)
                               ? (uint8_t)c->cfg.fixed_velocity
                               : midi_from_strength(p->strength);

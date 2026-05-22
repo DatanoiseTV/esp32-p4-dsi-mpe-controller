@@ -55,11 +55,37 @@ ESP32-P4 patterns:
   in the CC range and firm playing accelerates into the upper
   register naturally.
 - **Per-touch expression**:
-  - STRIKE  → velocity from contact area at NoteOn
-  - GLIDE   → MPE pitch bend from Δx since anchor
-  - SLIDE   → CC74 from absolute screen-Y (continuous across rows)
-  - PRESS   → channel pressure (Z) from ongoing contact area
+  - STRIKE  → NoteOn velocity from contact area
+  - GLIDE   → per-channel **Pitch Bend** from Δx since anchor
+  - SLIDE   → per-channel **CC74** (timbre) from absolute screen-Y
+              (continuous across rows)
+  - PRESS   → per-channel **Channel Pressure** from ongoing
+              contact area
   - LIFT    → NoteOff
+
+#### Expression wiring on the host
+
+The firmware sends the canonical MPE expression set, in the
+recommended strict order on every NoteOn: PB-centre → CC74 → Z=0 →
+NoteOn. On every transition from disconnected→connected the host
+also receives the **MPE-Config RPN** (Zone RPN 6) on the master
+channel + a per-member-channel **Pitch-Bend Range RPN** (RPN 0)
+matching `MPE_MIDI_PB_RANGE_SEMITONES`.
+
+So in your synth, **per-note** expression arrives as:
+
+| Dimension       | MIDI message                       | Typical default mapping       |
+| --------------- | ---------------------------------- | ----------------------------- |
+| Glide (X)       | Pitch Bend on the member channel   | Pitch                         |
+| Slide (Y/timbre)| **CC74** on the member channel     | Filter cutoff / "timbre" macro|
+| Press (Z)       | Channel Pressure on the member ch. | Filter env / volume / vibrato |
+
+Most MPE-aware synths (Surge XT, Diva, Pigments, Equator, Falcon)
+auto-map these to filter cutoff (CC74) and amp / filter envelope
+(Z) without any extra setup once they see the MPE-Config RPN. If
+your synth ignores CC74, check that it's running in *MPE mode* and
+not single-channel-poly, and that "expression" / "timbre" routing
+is enabled in its mod matrix.
 - **On-screen controls.** Cycle scale (Chromatic / Major / Minor /
   Pentatonic / Dorian / Blues), cycle root note, shift each row by
   ±3 octaves — all by tapping chips in the top bar.

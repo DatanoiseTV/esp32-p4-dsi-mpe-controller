@@ -592,7 +592,16 @@ extern "C" void app_main(void)
             s_prev_dirty[1] = full;
         }
 
-        if (!mpe_config_sent && mpe_applemidi_connected()) {
+        /* Track the AppleMIDI session live state. We re-send the
+           MPE configuration (Zone RPN + per-member PB-range RPN)
+           on EVERY disconnected → connected transition. Without
+           this, a host that drops the session (sleep, network
+           hiccup) wakes up treating member channels as plain mono
+           channels and never maps CC74 to per-note timbre — the
+           expression would look "wired" on our side but do nothing
+           on the host side. */
+        const bool midi_up_now = mpe_applemidi_connected();
+        if (midi_up_now && !mpe_config_sent) {
             const uint8_t members = (uint8_t)(cfg.member_hi - cfg.member_lo + 1);
             mpe_applemidi_send_mpe_config(members);
             for (int ch = cfg.member_lo; ch <= cfg.member_hi; ch++) {
@@ -601,6 +610,11 @@ extern "C" void app_main(void)
             mpe_config_sent = true;
             ESP_LOGI(TAG, "MPE configuration sent (%u members, PB ±%d semis)",
                      members, cfg.pb_range_semitones);
+        } else if (!midi_up_now && mpe_config_sent) {
+            /* Session went away. Clear the latch so we re-send when
+               (or if) it comes back. */
+            mpe_config_sent = false;
+            ESP_LOGW(TAG, "MIDI session lost — will re-send MPE config on reconnect");
         }
 
         /* Snapshot controller + touch state under the lock — fast,
