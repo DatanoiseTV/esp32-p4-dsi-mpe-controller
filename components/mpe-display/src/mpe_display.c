@@ -199,8 +199,20 @@ esp_err_t mpe_display_init(void)
         ESP_LOGE(TAG, "panel returned NULL framebuffer(s)");
         return ESP_ERR_INVALID_STATE;
     }
-    memset(s_fbs[0], 0, (size_t)MPE_DISPLAY_WIDTH * MPE_DISPLAY_HEIGHT * 2);
-    memset(s_fbs[1], 0, (size_t)MPE_DISPLAY_WIDTH * MPE_DISPLAY_HEIGHT * 2);
+
+    const size_t fb_bytes =
+        (size_t)MPE_DISPLAY_WIDTH * MPE_DISPLAY_HEIGHT * 2;
+    memset(s_fbs[0], 0, fb_bytes);
+    memset(s_fbs[1], 0, fb_bytes);
+
+    /* The CPU just wrote both framebuffers via cache; the DSI engine
+       reads them through DMA. Flush so memory matches what we wrote. */
+    esp_cache_msync(s_fbs[0], fb_bytes,
+                    ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+                    ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    esp_cache_msync(s_fbs[1], fb_bytes,
+                    ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+                    ESP_CACHE_MSYNC_FLAG_UNALIGNED);
     s_back_idx = 0;
 
     s_vsync_sem = xSemaphoreCreateBinary();
@@ -211,6 +223,19 @@ esp_err_t mpe_display_init(void)
     ESP_RETURN_ON_ERROR(
         esp_lcd_dpi_panel_register_event_callbacks(s_panel, &cbs, NULL),
         TAG, "register_event_callbacks");
+
+    /* Kick off the scanout. WITHOUT this initial draw_bitmap the
+       panel never starts refreshing and the on_color_trans_done /
+       on_refresh_done callbacks never fire — which is what pinned
+       us at 10 FPS for several rounds of debugging. The sibling
+       espdisp project does this exact same call after registering
+       its vsync ISR; matches the IDF dpi-panel reference pattern. */
+    ESP_RETURN_ON_ERROR(
+        esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
+                                  MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT,
+                                  s_fbs[0]),
+        TAG, "initial draw_bitmap");
+    s_back_idx = 1;   /* fb[0] is now front; we paint fb[1] next. */
 
     /* Register a PPA SRM client so the app can DMA per-rect template
        restores instead of doing them on the CPU. Failure here is
@@ -360,22 +385,12 @@ void mpe_display_flush_writes(void *buf, size_t bytes)
 
 esp_err_t mpe_display_present(void)
 {
-    if (!s_panel) return ESP_ERR_INVALID_STATE;
+    if (!s_panel || !s_vsync_sem) return ESP_ERR_INVALID_STATE;
 
-    /* Flush every dirty CPU cache line in the back buffer to
-       PSRAM so the DSI engine's DMA actually reads what we just
-       painted.
-       num_fbs=2 means we write directly into a panel-driver-owned
-       framebuffer. The driver's draw_bitmap path doesn't flush
-       OUR cache because it assumes the caller supplied an
-       independently-staged buffer (see the IDF v6.0
-       peripherals/ppa/ppa_dsi example — they allocate scratch
-       output buffers and pass those, never the internal FB).
-       Without this flush, partial cache eviction across the
-       ~1.2 MB FB leaves vertical stripes of stale halos visible
-       on screen for as long as the affected cache lines stay
-       resident — which is exactly the "stuck cyan column on a
-       key" symptom we kept hitting. */
+    /* Flush CPU writes from cache → PSRAM so the DSI engine sees
+       the pixels we just painted. The initial draw_bitmap in init
+       starts scanout; from here, every present queues a buffer
+       swap that becomes visible on the next refresh. */
     const size_t fb_bytes =
         (size_t)MPE_DISPLAY_WIDTH * MPE_DISPLAY_HEIGHT * 2;
     esp_cache_msync(s_fbs[s_back_idx], fb_bytes,
@@ -390,6 +405,14 @@ esp_err_t mpe_display_present(void)
         ESP_LOGW(TAG, "draw_bitmap failed: %s", esp_err_to_name(err));
         return err;
     }
+
+    /* Drop any stale signal, then wait for the swap to actually
+       complete (panel scanout switched to our buffer). 100 ms
+       safety timeout — in normal operation the callback fires
+       within one refresh (~17 ms at 60 Hz). The timeout protects
+       us from deadlocking if the dispatcher misbehaves. */
+    xSemaphoreTake(s_vsync_sem, 0);
+    xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(100));
 
     s_back_idx ^= 1;
     return ESP_OK;
