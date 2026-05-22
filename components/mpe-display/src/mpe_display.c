@@ -385,12 +385,11 @@ void mpe_display_flush_writes(void *buf, size_t bytes)
 
 esp_err_t mpe_display_present(void)
 {
-    if (!s_panel || !s_vsync_sem) return ESP_ERR_INVALID_STATE;
+    if (!s_panel) return ESP_ERR_INVALID_STATE;
 
     /* Flush CPU writes from cache → PSRAM so the DSI engine sees
        the pixels we just painted. The initial draw_bitmap in init
-       starts scanout; from here, every present queues a buffer
-       swap that becomes visible on the next refresh. */
+       starts scanout; subsequent presents queue buffer swaps. */
     const size_t fb_bytes =
         (size_t)MPE_DISPLAY_WIDTH * MPE_DISPLAY_HEIGHT * 2;
     esp_cache_msync(s_fbs[s_back_idx], fb_bytes,
@@ -406,13 +405,13 @@ esp_err_t mpe_display_present(void)
         return err;
     }
 
-    /* Drop any stale signal, then wait for the swap to actually
-       complete (panel scanout switched to our buffer). 100 ms
-       safety timeout — in normal operation the callback fires
-       within one refresh (~17 ms at 60 Hz). The timeout protects
-       us from deadlocking if the dispatcher misbehaves. */
-    xSemaphoreTake(s_vsync_sem, 0);
-    xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(100));
+    /* No explicit vsync wait: neither on_refresh_done nor
+       on_color_trans_done fires reliably on this EK79007 + IDF v6.0
+       combination, and a timeout-bound wait pins FPS at 10. The
+       panel driver internally serialises back-to-back draw_bitmap
+       calls behind the in-flight scanout, so presents naturally
+       pace to the refresh rate — at the cost of occasional tearing
+       on individual frames if rendering races the swap. */
 
     s_back_idx ^= 1;
     return ESP_OK;
