@@ -362,15 +362,26 @@ esp_err_t mpe_display_present(void)
 {
     if (!s_panel) return ESP_ERR_INVALID_STATE;
 
-    /* Queue the swap. The EK79007 driver flips its DMA scanout
-       source to the buffer we just painted; subsequent draw_bitmap
-       calls naturally serialise behind the in-flight scanout, so
-       back-to-back presents are paced to the refresh rate without
-       us touching a semaphore.
-       The on_refresh_done / on_color_trans_done callbacks were
-       expected to give us an explicit per-swap signal, but neither
-       fires on this panel + IDF v6.0 combination — every wait
-       hit the 100 ms safety timeout and pinned FPS at 10. */
+    /* Flush every dirty CPU cache line in the back buffer to
+       PSRAM so the DSI engine's DMA actually reads what we just
+       painted.
+       num_fbs=2 means we write directly into a panel-driver-owned
+       framebuffer. The driver's draw_bitmap path doesn't flush
+       OUR cache because it assumes the caller supplied an
+       independently-staged buffer (see the IDF v6.0
+       peripherals/ppa/ppa_dsi example — they allocate scratch
+       output buffers and pass those, never the internal FB).
+       Without this flush, partial cache eviction across the
+       ~1.2 MB FB leaves vertical stripes of stale halos visible
+       on screen for as long as the affected cache lines stay
+       resident — which is exactly the "stuck cyan column on a
+       key" symptom we kept hitting. */
+    const size_t fb_bytes =
+        (size_t)MPE_DISPLAY_WIDTH * MPE_DISPLAY_HEIGHT * 2;
+    esp_cache_msync(s_fbs[s_back_idx], fb_bytes,
+                    ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+                    ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+
     esp_err_t err = esp_lcd_panel_draw_bitmap(
         s_panel, 0, 0,
         MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT,
