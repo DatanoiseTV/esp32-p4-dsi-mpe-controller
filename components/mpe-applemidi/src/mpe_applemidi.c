@@ -449,9 +449,11 @@ esp_err_t mpe_applemidi_start(const char *host, uint16_t port,
     }
 
     atomic_store(&s_c.running, true);
-    BaseType_t ok = xTaskCreate(session_task, "applemidi",
+    /* Pinned to CPU 1: this task does select() + UDP I/O, blocking
+       calls would block the render task if scheduled on CPU 0. */
+    BaseType_t ok = xTaskCreatePinnedToCore(session_task, "applemidi",
                                 APPLEMIDI_TASK_STACK, NULL,
-                                APPLEMIDI_TASK_PRIO, &s_c.task);
+                                APPLEMIDI_TASK_PRIO, &s_c.task, 1);
     if (ok != pdPASS) {
         atomic_store(&s_c.running, false);
         close(s_c.sock_ctrl);

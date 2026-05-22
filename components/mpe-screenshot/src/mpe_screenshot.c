@@ -148,6 +148,9 @@ esp_err_t mpe_screenshot_start(void)
     cfg.lru_purge_enable = true;
     cfg.stack_size       = 6144;     /* httpd worker stack */
     cfg.max_uri_handlers = 4;
+    cfg.core_id          = 1;        /* serve HTTP off the render CPU
+                                        so a screenshot fetch can't
+                                        steal frame budget */
 
     esp_err_t err = httpd_start(&s_http, &cfg);
     if (err != ESP_OK) {

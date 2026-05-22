@@ -703,10 +703,17 @@ extern "C" void app_main(void)
         s_back_local = 0;
     }
 
-    /* 10. Kick the realtime touch + MPE dispatch task. */
+    /* 10. Kick the realtime touch + MPE dispatch task on CPU 1.
+       Pinning matters: the render loop (this task) lives on CPU 0
+       and is the one rendering frames. Without pinning, FreeRTOS
+       may schedule the touch task on CPU 0 too, where both fight
+       for cycles and FPS halves. CPU 1 sits mostly idle otherwise,
+       so the touch task gets a full core to itself for GT911 polls
+       + MIDI/OSC sends. */
     if (touch_ok) {
-        xTaskCreate(touch_task, "touch", 4096, NULL, 7, NULL);
-        ESP_LOGI(TAG, "touch task @ 250 Hz");
+        xTaskCreatePinnedToCore(touch_task, "touch", 4096, NULL, 7,
+                                NULL, 1);
+        ESP_LOGI(TAG, "touch task @ 250 Hz (pinned to CPU 1)");
     }
 
     /* 11. Render loop. */
