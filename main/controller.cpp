@@ -304,16 +304,21 @@ static uint16_t pb_from_displacement(const mpe_controller *c,
  *
  * Pre-computed into a 128-entry LUT at init so the hot path is two
  * memory lookups (one for velocity, one for Z) with no FPU. */
-#define VELOCITY_CURVE_MAX_IN  90
-#define VELOCITY_CURVE_EXP     1.7f
+/* Both knobs come from Kconfig so the player can match the curve to
+   their panel + playing style. Defaults match a typical fingertip
+   on the EK79007 glass with a moderately exponential ramp. */
+#define VELOCITY_CURVE_MAX_IN  CONFIG_MPE_PRESSURE_SATURATION
+#define VELOCITY_CURVE_EXP     ((float)CONFIG_MPE_PRESSURE_EXPONENT_X100 / 100.0f)
 static uint8_t s_velocity_lut[128];
 
 static void init_velocity_curve_(void)
 {
+    const int   max_in = VELOCITY_CURVE_MAX_IN;
+    const float exp_v  = VELOCITY_CURVE_EXP;
     for (int s = 0; s < 128; s++) {
-        int sat = s > VELOCITY_CURVE_MAX_IN ? VELOCITY_CURVE_MAX_IN : s;
-        float n = (float)sat / (float)VELOCITY_CURVE_MAX_IN;
-        float v = powf(n, VELOCITY_CURVE_EXP) * 127.0f;
+        int sat = s > max_in ? max_in : s;
+        float n = (float)sat / (float)max_in;
+        float v = powf(n, exp_v) * 127.0f;
         if (v < 0) v = 0;
         if (v > 127) v = 127;
         s_velocity_lut[s] = (uint8_t)(v + 0.5f);

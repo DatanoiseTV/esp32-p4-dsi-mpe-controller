@@ -153,6 +153,38 @@ menu "esp32-p4-nano-mpempe"
                 chip reports area not real force, but heavier presses
                 spread the fingerprint and produce a usable velocity
                 proxy. Set non-zero for a fixed-velocity controller.
+
+        config MPE_PRESSURE_SATURATION
+            int "Contact-area value that maps to full velocity / Z"
+            default 90
+            range 30 200
+            help
+                The GT911 reports contact size as a roughly 7-bit
+                value (0..127 typical for a finger). This is the
+                upper input bound of the velocity / pressure curve:
+                strength ≥ this maps to MIDI 127.
+                Lower it (e.g. 60) if you play with a light touch
+                and want firm response from a softer press. Raise it
+                (e.g. 120) if your fingers report unusually high
+                contact-area values or you want the heaviest presses
+                to reach max — at the cost of harder light response.
+                The default 90 matches a typical fingertip on the
+                EK79007's glass.
+
+        config MPE_PRESSURE_EXPONENT_X100
+            int "Pressure curve exponent ×100 (e.g. 170 = power 1.7)"
+            default 170
+            range 100 400
+            help
+                Shape of the velocity/pressure curve:
+                  100 = linear         (full dynamic range, harsh)
+                  150 = mild concave   (softer initial response)
+                  170 = default        (exponential feel)
+                  220 = aggressive     (most range at top)
+                Lower values = more level light playing. Higher
+                values = louder dynamics on hard press, quieter on
+                light press. A musical instrument typically wants
+                a value between 150 and 200.
     endmenu
 
 endmenu
