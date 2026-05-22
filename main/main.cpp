@@ -478,12 +478,15 @@ static void touch_task(void *arg)
         mpe_controller_unlock(&s_ctrl);
         s_active_fingers.store(active, std::memory_order_relaxed);
 
-        /* Did any finger just release? Trigger a multi-frame full
-           clean on the renderer so any leftover mid-movement
-           pixels on either buffer get fully replaced with template
-           content. 4 frames covers worst-case double-buffer +
-           1-frame snap latency margins. */
-        if (active < prev_active) {
+        /* When ALL fingers come off — i.e. the last touch lifted —
+           force the renderer through a multi-frame full clean so
+           both buffers definitely look like the empty keyboard
+           again. Mid-chord releases (5→4 finger drops) are NOT
+           triggered: the residual queue handles per-finger areas,
+           and the GT911 occasionally drops one of 5 sustained
+           fingers and re-acquires it, which used to pin
+           force_restore at >0 indefinitely and tank FPS to ~15. */
+        if (active == 0 && prev_active > 0) {
             s_force_full_restore.store(4, std::memory_order_release);
         }
         prev_active = active;

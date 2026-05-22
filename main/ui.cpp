@@ -108,27 +108,11 @@ void mpe_ui_render(mpe_ui *u, const mp_target *t,
        title and the control chips. Per-frame dynamics are: key
        activity halos, finger trails, finger glows, status text. */
 
-    /* 1. Activity halo: light up the touched key in channel colour.
-          Only the TOP HALF of the key — that's where the player's
-          eye lives during play, and halving the alpha-blend area
-          across 5 fingers saves multiple ms of per-pixel work per
-          frame (the bottleneck under chord load). Black keys get
-          a smaller portion since they're already shorter. */
-    for (int i = 0; i < MPE_CTRL_MAX_FINGERS; i++) {
-        const mpe_finger *f = &c->fingers[i];
-        if (f->is_ui) continue;
-        const float recency = (f->ch >= 0) ? c->ch_busy_recency[f->ch] : 0.0f;
-        if (recency < 0.02f) continue;
-        if (f->key_idx < 0 || f->key_idx >= c->kb.n_keys) continue;
-        const mpe_key *k = &c->kb.keys[f->key_idx];
-        const rgb col = kChannelColor[f->ch & 0x0F];
-        const uint8_t a = (uint8_t)(recency * (k->is_black ? 150.0f : 110.0f));
-        const int halo_h = k->is_black ? (k->h * 50) / 100
-                                       : (k->h * 50) / 100;
-        mp_fill_rect_a(t, k->x + 1, k->y + 1,
-                       k->w - 2, halo_h - 1,
-                       col.r, col.g, col.b, a);
-    }
+    /* Activity halo removed. With 5 fingers held it was the
+       single largest remaining per-frame cost — ~32K pixels of
+       alpha blend per frame for an effect the channel-coloured
+       finger dot already communicates. Dropping it puts about
+       2 ms back into the frame budget under chord load. */
 
     /* 2. Solid finger dots, pressure-scaled. The previous soft-glow
           stack (outer additive halo + inner alpha core + AA spec +
