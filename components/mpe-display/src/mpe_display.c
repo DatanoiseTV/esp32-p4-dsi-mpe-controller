@@ -49,14 +49,36 @@ static const char *TAG = "display";
 #define DPHY_LDO_CHAN        3
 #define DPHY_LDO_VOLTAGE_MV  2500
 #define DSI_LANES            2
-#define LCD_NUM_FBS          2
 
+/* Architecture note (post esp-bsp issue #581 finding):
+ *
+ *   esp_lcd_dpi_panel + num_fbs=2 is broken on IDF v6.0 — the
+ *   callback dispatcher doesn't fire reliably and the cache-flush
+ *   path doesn't handle two buffers. Symptoms in our case were a
+ *   permanent vsync-wait timeout (FPS pinned at 10) and ghost
+ *   artifacts that no amount of dirty-rect bookkeeping could clean
+ *   up reliably.
+ *
+ *   The working pattern from PavelMostovoy/ESP32-P4-minimal-DSI-demo
+ *   (and Espressif's own ppa_dsi example) is single-FB:
+ *     - Driver owns ONE internal framebuffer (num_fbs = 1).
+ *     - We allocate our own scratch RAM buffer.
+ *     - Each frame we paint into the scratch, then call
+ *       esp_lcd_panel_draw_bitmap(panel, 0,0,W,H, scratch). The
+ *       driver DMA-copies our scratch into its internal FB and the
+ *       on_color_trans_done callback fires reliably.
+ *     - We wait on a binary semaphore signalled from the callback
+ *       so the next paint can begin without tearing.
+ *
+ *   That's how this file is structured below. The old double-FB
+ *   API surface (back / front buffer accessors) is retained for
+ *   source compatibility, but now both return the same scratch
+ *   buffer — there is no front/back distinction. */
 static esp_ldo_channel_handle_t  s_phy_pwr   = NULL;
 static esp_lcd_dsi_bus_handle_t  s_bus       = NULL;
 static esp_lcd_panel_io_handle_t s_io        = NULL;
 static esp_lcd_panel_handle_t    s_panel     = NULL;
-static uint16_t                 *s_fbs[LCD_NUM_FBS] = { NULL, NULL };
-static int                       s_back_idx  = 0;
+static uint16_t                 *s_scratch   = NULL;   /* our paint buf */
 static SemaphoreHandle_t         s_vsync_sem = NULL;
 static bool                      s_bl_inited = false;
 static i2c_master_bus_handle_t   s_i2c_bus   = NULL;
@@ -170,7 +192,7 @@ esp_err_t mpe_display_init(void)
 
     esp_lcd_dpi_panel_config_t dpi_cfg =
         EK79007_1024_600_PANEL_60HZ_CONFIG_CF(LCD_COLOR_FMT_RGB565);
-    dpi_cfg.num_fbs            = LCD_NUM_FBS;
+    dpi_cfg.num_fbs            = 1;            /* single internal FB */
     dpi_cfg.dpi_clock_freq_mhz = CONFIG_DISP_DPI_CLOCK_FREQ_MHZ;
 
     ek79007_vendor_config_t vendor = {};
@@ -189,31 +211,22 @@ esp_err_t mpe_display_init(void)
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG, "reset");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel),  TAG, "init");
 
-    void *fb0 = NULL, *fb1 = NULL;
-    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_get_frame_buffer(
-                            s_panel, LCD_NUM_FBS, &fb0, &fb1),
-                        TAG, "get_frame_buffer");
-    s_fbs[0] = (uint16_t *)fb0;
-    s_fbs[1] = (uint16_t *)fb1;
-    if (!s_fbs[0] || !s_fbs[1]) {
-        ESP_LOGE(TAG, "panel returned NULL framebuffer(s)");
-        return ESP_ERR_INVALID_STATE;
-    }
+    /* Explicit display-on — the demo does this and apparently it's
+       not implicit on panel_init for all panels. */
+    esp_lcd_panel_disp_on_off(s_panel, true);
 
+    /* Allocate our scratch paint buffer. MALLOC_CAP_DMA flag matters:
+       the driver passes the pointer to the DMA descriptor, and the
+       region must be DMA-capable. SPIRAM caps adds PSRAM (the only
+       place a 1.2 MB buffer fits). */
     const size_t fb_bytes =
         (size_t)MPE_DISPLAY_WIDTH * MPE_DISPLAY_HEIGHT * 2;
-    memset(s_fbs[0], 0, fb_bytes);
-    memset(s_fbs[1], 0, fb_bytes);
-
-    /* The CPU just wrote both framebuffers via cache; the DSI engine
-       reads them through DMA. Flush so memory matches what we wrote. */
-    esp_cache_msync(s_fbs[0], fb_bytes,
-                    ESP_CACHE_MSYNC_FLAG_DIR_C2M |
-                    ESP_CACHE_MSYNC_FLAG_UNALIGNED);
-    esp_cache_msync(s_fbs[1], fb_bytes,
-                    ESP_CACHE_MSYNC_FLAG_DIR_C2M |
-                    ESP_CACHE_MSYNC_FLAG_UNALIGNED);
-    s_back_idx = 0;
+    s_scratch = (uint16_t *)heap_caps_aligned_calloc(
+        64, 1, fb_bytes, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
+    if (!s_scratch) {
+        ESP_LOGE(TAG, "scratch alloc failed (%zu B)", fb_bytes);
+        return ESP_ERR_NO_MEM;
+    }
 
     s_vsync_sem = xSemaphoreCreateBinary();
     if (!s_vsync_sem) return ESP_ERR_NO_MEM;
@@ -224,18 +237,20 @@ esp_err_t mpe_display_init(void)
         esp_lcd_dpi_panel_register_event_callbacks(s_panel, &cbs, NULL),
         TAG, "register_event_callbacks");
 
-    /* Kick off the scanout. WITHOUT this initial draw_bitmap the
-       panel never starts refreshing and the on_color_trans_done /
-       on_refresh_done callbacks never fire — which is what pinned
-       us at 10 FPS for several rounds of debugging. The sibling
-       espdisp project does this exact same call after registering
-       its vsync ISR; matches the IDF dpi-panel reference pattern. */
+    /* Initial draw_bitmap of the cleared scratch — gets the panel's
+       internal scanout going. Subsequent presents fire callbacks
+       reliably in single-FB mode. */
+    esp_cache_msync(s_scratch, fb_bytes,
+                    ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+                    ESP_CACHE_MSYNC_FLAG_UNALIGNED);
     ESP_RETURN_ON_ERROR(
         esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
                                   MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT,
-                                  s_fbs[0]),
+                                  s_scratch),
         TAG, "initial draw_bitmap");
-    s_back_idx = 1;   /* fb[0] is now front; we paint fb[1] next. */
+    /* That first draw triggers the first on_color_trans_done; drain
+       it so the very first present() doesn't see a stale signal. */
+    xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(100));
 
     /* Register a PPA SRM client so the app can DMA per-rect template
        restores instead of doing them on the CPU. Failure here is
@@ -268,12 +283,19 @@ esp_err_t mpe_display_init(void)
 
 uint16_t *mpe_display_back_buffer(void)
 {
-    return s_fbs[s_back_idx];
+    /* In single-FB mode there's no front/back distinction — we
+       paint into the same scratch buffer every frame. Returning it
+       here keeps the call-site API identical. */
+    return s_scratch;
 }
 
 uint16_t *mpe_display_front_buffer(void)
 {
-    return s_fbs[s_back_idx ^ 1];
+    /* For the screenshot endpoint: the scratch holds the most
+       recently-painted frame (the driver's internal FB has the
+       same content, just one swap-cycle delayed). Reading the
+       scratch is equivalent and avoids an extra cache invalidate. */
+    return s_scratch;
 }
 
 void mpe_display_rect_copy(uint16_t *dst, const uint16_t *src,
@@ -381,32 +403,36 @@ void mpe_display_flush_writes(void *buf, size_t bytes)
 
 esp_err_t mpe_display_present_y(int y0, int h)
 {
-    if (!s_panel) return ESP_ERR_INVALID_STATE;
     (void)y0; (void)h;
-
-    /* No explicit C2M cache flush. The EK79007 / esp_lcd_dpi_panel
-       driver does its own cache management on draw_bitmap, and our
-       previous explicit C2M of large Y bands was costing 5-10 ms
-       per frame at 5 fingers held — the single largest remaining
-       contributor to the user-reported low FPS under chord load.
-       If pixel-corruption ghosts return, the lighter fix is to
-       flush only the small dirty rects we wrote in this frame, not
-       the whole min..max Y band. */
-
-    esp_err_t err = esp_lcd_panel_draw_bitmap(
-        s_panel, 0, 0,
-        MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT,
-        s_fbs[s_back_idx]);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "draw_bitmap failed: %s", esp_err_to_name(err));
-        return err;
-    }
-    s_back_idx ^= 1;
-    return ESP_OK;
+    return mpe_display_present();   /* single-FB: no Y optimisation */
 }
 
 esp_err_t mpe_display_present(void)
 {
-    /* Full-FB flush — for callers that don't track dirty Y. */
-    return mpe_display_present_y(0, MPE_DISPLAY_HEIGHT);
+    if (!s_panel || !s_vsync_sem || !s_scratch) return ESP_ERR_INVALID_STATE;
+
+    /* Flush our CPU writes from cache → PSRAM so the driver's DMA
+       sees fresh pixels. */
+    const size_t fb_bytes =
+        (size_t)MPE_DISPLAY_WIDTH * MPE_DISPLAY_HEIGHT * 2;
+    esp_cache_msync(s_scratch, fb_bytes,
+                    ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+                    ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+
+    esp_err_t err = esp_lcd_panel_draw_bitmap(
+        s_panel, 0, 0,
+        MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT,
+        s_scratch);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "draw_bitmap failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    /* on_color_trans_done DOES fire reliably in single-FB mode
+       (verified by the PavelMostovoy/ESP32-P4-minimal-DSI-demo).
+       This blocks until the panel has actually finished scanning
+       our buffer into its internal FB — natural pacing to the
+       refresh rate without us managing buffer indices. */
+    xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(100));
+    return ESP_OK;
 }

@@ -691,16 +691,13 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "static template baked (%zu B, v%u)",
              kFbBytes, (unsigned)baked_version);
 
-    /* 9. Seed BOTH display buffers with the template so the first
-       frames are correct everywhere we don't overwrite. */
+    /* 9. Paint the template into the scratch buffer once. The
+       render loop overwrites it every frame anyway, but this gives
+       a clean first frame before the loop starts. */
     {
-        uint16_t *b0 = mpe_display_back_buffer();
-        memcpy(b0, s_template, kFbBytes);
+        uint16_t *b = mpe_display_back_buffer();
+        memcpy(b, s_template, kFbBytes);
         mpe_display_present();
-        uint16_t *b1 = mpe_display_back_buffer();
-        memcpy(b1, s_template, kFbBytes);
-        mpe_display_present();
-        s_back_local = 0;
     }
 
     /* 10. Kick the realtime touch + MPE dispatch task on CPU 1.
@@ -776,121 +773,27 @@ extern "C" void app_main(void)
         snap_ctrl = s_ctrl;       /* shallow copy ok — no pointers we own */
         snap_tf   = s_latest_tf;
         mpe_controller_unlock(&s_ctrl);
-        /* Re-point any pointer in the snapshot back to the lock that's
-           still owned by the live controller (we don't lock through
-           the snapshot). */
         snap_ctrl.lock = nullptr;
-
-        /* Trails removed — the new solid-dot finger visual doesn't
-           use them, so no per-frame ring-buffer update needed. */
+        (void)s_force_full_restore;
+        (void)s_back_local;
         (void)ui;
 
+        /* Single-FB architecture (post esp-bsp #581 finding).
+           num_fbs=2 is broken in IDF v6.0; we now own a scratch
+           buffer, paint a fresh full frame into it, and let
+           draw_bitmap copy it into the driver's internal FB. All
+           the partial-restore / dirty-rect / force-restore
+           machinery for the old buffer-pair model is gone. */
         uint16_t *back = mpe_display_back_buffer();
         mp_target target = { back, MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT };
 
-        /* Compute this frame's dirty rects. The static template
-           owns the title, the control chips, and the empty status
-           panel; the dynamic overlay writes status text into the
-           lower row of the top bar and finger glows + per-finger
-           labels into the keyboard area. */
-        dirty_list_t cur = {};
-        /* Status text row spans the full width below the buttons. */
-        dirty_push(&cur, 0, MPE_UI_STATUS_Y,
-                   MPE_DISPLAY_WIDTH, MPE_UI_STATUS_H);
-
-        /* Finger-dot max radius is 32 (pressure-scaled); 44 px
-           margin keeps the dirty rect honest with a small safety
-           buffer for the white centre + any per-finger chip
-           overflow. Smaller than the old 72 px glow margin → less
-           per-frame partial-restore work. */
-        const int glow_margin = 44;
-        for (int i = 0; i < MPE_CTRL_MAX_FINGERS; i++) {
-            const mpe_finger *f = &snap_ctrl.fingers[i];
-            if (f->is_ui) continue;  /* UI taps have no glow drawn */
-            int min_x =  INT32_MAX, min_y =  INT32_MAX;
-            int max_x = -INT32_MAX, max_y = -INT32_MAX;
-            bool any = false;
-
-            /* Current finger position from x/y_norm. */
-            if (f->active) {
-                const int px = snap_ctrl.cfg.ui_x +
-                               (int)(f->x_norm * (float)snap_ctrl.cfg.ui_w);
-                const int py = snap_ctrl.cfg.ui_y +
-                               (int)((1.0f - f->y_norm) * (float)snap_ctrl.cfg.ui_h);
-                if (px < min_x) min_x = px;
-                if (py < min_y) min_y = py;
-                if (px > max_x) max_x = px;
-                if (py > max_y) max_y = py;
-                any = true;
-            }
-            /* Activity halo: covers the touched key's bbox. */
-            if (f->ch >= 0 &&
-                snap_ctrl.ch_busy_recency[f->ch] > 0.02f &&
-                f->key_idx >= 0 && f->key_idx < snap_ctrl.kb.n_keys) {
-                const mpe_key *k = &snap_ctrl.kb.keys[f->key_idx];
-                if (k->x < min_x) min_x = k->x;
-                if (k->y < min_y) min_y = k->y;
-                if (k->x + k->w > max_x) max_x = k->x + k->w;
-                if (k->y + k->h > max_y) max_y = k->y + k->h;
-                any = true;
-            }
-            if (!any) continue;
-            /* Just the dot + activity-halo bbox now that the
-               floating chip is gone. glow_margin handles the
-               finger-dot radius + any safety. */
-            dirty_push(&cur,
-                       min_x - glow_margin,
-                       min_y - glow_margin,
-                       (max_x - min_x) + 2 * glow_margin,
-                       (max_y - min_y) + 2 * glow_margin);
-        }
-        /* Latest-touch positions may be slightly ahead of the
-           controller snapshot — include them too so the glow drawn
-           by mpe_ui_render against latest_tf doesn't escape any rect. */
-        for (int i = 0; i < snap_tf.count && i < MPE_TOUCH_MAX_POINTS; i++) {
-            int px = snap_tf.points[i].x;
-            int py = snap_tf.points[i].y;
-            dirty_push(&cur,
-                       px - glow_margin, py - glow_margin,
-                       2 * glow_margin, 2 * glow_margin);
-        }
-
-        /* Released-finger residuals (stuck-halo backstop). The
-           controller marks the last touched key area for ~200 ms
-           after each finger lifts so multiple restore passes are
-           guaranteed on both buffers regardless of the normal
-           dirty-rect bookkeeping. */
-        for (int i = 0; i < snap_ctrl.n_residual; i++) {
-            const mpe_residual_dirty *r = &snap_ctrl.residual[i];
-            dirty_push(&cur,
-                       r->x - 4, r->y - 4,
-                       r->w + 8, r->h + 8);
-        }
-
-        /* If the touch task signalled a recent release, force a
-           full template→back memcpy for the next few frames. This
-           guarantees both alternating buffers see a fully-clean
-           paint and any stale mid-movement pixels get wiped — the
-           user-reported "going back between 2 frames" symptom. */
-        const dirty_list_t *prev = &s_prev_dirty[s_back_local];
-        int forced = s_force_full_restore.load(std::memory_order_acquire);
-        bool full_restore_this_frame = (forced > 0);
-        if (full_restore_this_frame) {
-            memcpy(back, s_template, kFbBytes);
-            s_force_full_restore.store(forced - 1, std::memory_order_release);
-            /* Mark this buffer's whole area as the saved dirty for
-               the next pass through, so the partial-restore chain
-               picks up cleanly after the burst ends. */
-            dirty_list_t full = {};
-            dirty_push(&full, 0, 0, MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT);
-            s_prev_dirty[s_back_local] = full;
-        } else {
-            /* Restore both lists (previous frame on this buffer +
-               current). Some pixels get touched twice — fine, the
-               copy is idempotent. */
-            for (int i = 0; i < prev->n; i++) restore_rect_(back, s_template, prev->r[i]);
-            for (int i = 0; i < cur.n;  i++) restore_rect_(back, s_template, cur.r[i]);
-        }
+        /* Full template → scratch via PPA (DMA, ~3-5 ms at 1.2 MB
+           on this stack — vs ~30 ms for CPU memcpy). The driver
+           handles cache management on draw_bitmap; we don't need
+           to track dirty rects ourselves. */
+        mpe_display_rect_copy(back, s_template,
+                              0, 0,
+                              MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT);
 
         mpe_ui_status st = {};
         st.wifi_ip        = wifi_ip;
@@ -903,31 +806,7 @@ extern "C" void app_main(void)
 
         mpe_ui_render(&ui, &target, &snap_ctrl, &snap_tf, &st);
 
-        /* Compute the dirty Y band — union of every rect we
-           restored + drew on top of this frame. Flushing only
-           those rows saves significant time vs full-FB flush
-           under chord load (5 fingers wrote ~half the screen,
-           full flush was wasting cycles on the other half). */
-        int y_min = MPE_DISPLAY_HEIGHT, y_max = 0;
-        const dirty_list_t *prev_for_flush = &s_prev_dirty[s_back_local];
-        for (int i = 0; i < prev_for_flush->n; i++) {
-            const rect_t *r = &prev_for_flush->r[i];
-            if (r->y < y_min) y_min = r->y;
-            if (r->y + r->h > y_max) y_max = r->y + r->h;
-        }
-        for (int i = 0; i < cur.n; i++) {
-            const rect_t *r = &cur.r[i];
-            if (r->y < y_min) y_min = r->y;
-            if (r->y + r->h > y_max) y_max = r->y + r->h;
-        }
-        if (full_restore_this_frame) {
-            /* Full FB was touched — full-FB flush. */
-            mpe_display_present();
-        } else if (y_max > y_min) {
-            mpe_display_present_y(y_min, y_max - y_min);
-        } else {
-            mpe_display_present();
-        }
+        mpe_display_present();
 
         frames++;
         const int64_t now = esp_timer_get_time();
