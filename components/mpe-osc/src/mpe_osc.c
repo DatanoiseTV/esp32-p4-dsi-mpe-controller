@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <errno.h>
+#include <fcntl.h>
 
 #include "esp_log.h"
 #include "lwip/sockets.h"
@@ -194,6 +195,14 @@ static int open_sock_(mpe_osc_client *c)
         ESP_LOGW(TAG, "socket() failed: %d", errno);
         return -1;
     }
+    /* Non-blocking: OSC bundles fire at up to bundle_rate_hz from
+       the touch task while it holds the controller lock. EAGAIN
+       on send is fine — we'd rather drop a frame of OSC than
+       stall the render. */
+    int flags = fcntl(s, F_GETFL, 0);
+    if (flags != -1) fcntl(s, F_SETFL, flags | O_NONBLOCK);
+    int sndbuf = 8 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof sndbuf);
     c->sock = s;
     return 0;
 }
@@ -208,10 +217,11 @@ esp_err_t mpe_osc_client_send(mpe_osc_client *c,
     ssize_t n = sendto(c->sock, data, len, 0,
                        (struct sockaddr *)&c->addr, sizeof c->addr);
     if (n < 0) {
+        /* EAGAIN / EWOULDBLOCK: send buffer briefly full. Dropping
+           one OSC bundle is fine for an instrument; the next one
+           ships in a few ms. Don't tally as an error. */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return ESP_OK;
         c->consecutive_errors++;
-        /* The lwIP send path returns EHOSTUNREACH/ENETUNREACH if the
-           ARP entry hasn't materialised yet — recoverable; just drop
-           the packet. After many in a row, recycle the socket. */
         if (c->consecutive_errors >= 16) {
             ESP_LOGW(TAG, "many send errors; reopening socket");
             close(c->sock);

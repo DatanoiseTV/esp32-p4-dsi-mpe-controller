@@ -43,6 +43,7 @@
 #include <stdio.h>
 #include <stdatomic.h>
 #include <errno.h>
+#include <fcntl.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -190,9 +191,24 @@ static int open_udp_socket(uint16_t *bound_port_out)
 {
     int s = socket(AF_INET, SOCK_DGRAM, 0);
     if (s < 0) return -1;
-    /* Make recvfrom non-blocking; we use select() to wake up. */
     int yes = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+
+    /* Non-blocking sends. At 250 Hz touch + 5 fingers we can fire
+       ~30 small UDP packets per second on this socket; lwIP's
+       sendto is normally fast but can stall the calling task
+       (which is the touch task — holding the controller lock) when
+       the WiFi/SDIO queue is briefly full. EAGAIN from a non-block
+       send is fine for an instrument: dropping one PB / CC update
+       under congestion is inaudible, and getting the controller
+       lock back to the render task quickly is what matters. */
+    int flags = fcntl(s, F_GETFL, 0);
+    if (flags != -1) fcntl(s, F_SETFL, flags | O_NONBLOCK);
+
+    /* Bigger send buffer also helps absorb bursts. */
+    int sndbuf = 16 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof sndbuf);
+
     /* Bind to ephemeral local port. */
     struct sockaddr_in addr = { .sin_family = AF_INET,
                                  .sin_addr.s_addr = htonl(INADDR_ANY),
