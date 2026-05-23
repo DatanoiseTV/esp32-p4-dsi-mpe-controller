@@ -799,17 +799,34 @@ extern "C" void app_main(void)
             dirty_push(&cur, r->x - 4, r->y - 4, r->w + 8, r->h + 8);
         }
 
-        /* Restore union of (last frame's writes) + (this frame's
-           writes) from template to scratch via PPA. The PPA SRM
-           DMA path is much faster than CPU memcpy for these
-           medium-sized rects. */
-        for (int i = 0; i < s_prev_dirty.n; i++) {
-            const rect_t *r = &s_prev_dirty.r[i];
-            mpe_display_rect_copy(back, s_template, r->x, r->y, r->w, r->h);
-        }
-        for (int i = 0; i < cur.n; i++) {
-            const rect_t *r = &cur.r[i];
-            mpe_display_rect_copy(back, s_template, r->x, r->y, r->w, r->h);
+        /* Coalesce ALL dirty rects (prev + cur) into a single
+           bounding box and do ONE PPA copy. Doing per-rect restore
+           was issuing ~10-20 PPA calls per frame for chord load,
+           each with ~100-200 µs of setup overhead; the actual
+           per-rect transfer was a small fraction of the total work.
+           One bbox copy is way fewer round-trips through the PPA
+           driver and the cache-msync path.
+           Note: held fingers produce nearly-identical prev and cur
+           rects, so the bbox is barely larger than the union of
+           current rects anyway. */
+        int bbox_x0 = MPE_DISPLAY_WIDTH;
+        int bbox_y0 = MPE_DISPLAY_HEIGHT;
+        int bbox_x1 = 0;
+        int bbox_y1 = 0;
+        auto bbox_extend = [&](const rect_t *r) {
+            if (r->x         < bbox_x0) bbox_x0 = r->x;
+            if (r->y         < bbox_y0) bbox_y0 = r->y;
+            if (r->x + r->w  > bbox_x1) bbox_x1 = r->x + r->w;
+            if (r->y + r->h  > bbox_y1) bbox_y1 = r->y + r->h;
+        };
+        for (int i = 0; i < s_prev_dirty.n; i++) bbox_extend(&s_prev_dirty.r[i]);
+        for (int i = 0; i < cur.n;          i++) bbox_extend(&cur.r[i]);
+
+        if (bbox_x1 > bbox_x0 && bbox_y1 > bbox_y0) {
+            mpe_display_rect_copy(back, s_template,
+                                  bbox_x0, bbox_y0,
+                                  bbox_x1 - bbox_x0,
+                                  bbox_y1 - bbox_y0);
         }
         s_prev_dirty = cur;
 
@@ -824,24 +841,12 @@ extern "C" void app_main(void)
 
         mpe_ui_render(&ui, &target, &snap_ctrl, &snap_tf, &st);
 
-        /* Present only the actual dirty Y band — the driver's DMA
-           is the dominant per-frame cost and copying full 1.2 MB
-           every frame burns ~15 ms regardless of how little we
-           changed. Computing the bbox from prev+cur dirty rects
-           keeps the DMA work proportional to what we drew. */
-        int present_y_min = MPE_DISPLAY_HEIGHT;
-        int present_y_max = 0;
-        for (int i = 0; i < s_prev_dirty.n; i++) {
-            const rect_t *r = &s_prev_dirty.r[i];
-            if (r->y < present_y_min) present_y_min = r->y;
-            if (r->y + r->h > present_y_max) present_y_max = r->y + r->h;
-        }
-        if (present_y_max > present_y_min) {
-            mpe_display_present_y(present_y_min,
-                                  present_y_max - present_y_min);
+        /* Present only the bbox we restored + rendered into. The
+           driver DMA-copies just that Y band into its internal FB
+           and we flush only those cache rows. */
+        if (bbox_y1 > bbox_y0) {
+            mpe_display_present_y(bbox_y0, bbox_y1 - bbox_y0);
         } else {
-            /* Nothing to show this frame (no dirty area) — still
-               present so the driver's swap chain ticks. */
             mpe_display_present_y(0, 1);
         }
 

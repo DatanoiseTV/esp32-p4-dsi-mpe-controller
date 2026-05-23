@@ -409,25 +409,31 @@ esp_err_t mpe_display_present_y(int y0, int h)
     if (y0 + h > MPE_DISPLAY_HEIGHT) h = MPE_DISPLAY_HEIGHT - y0;
     if (h <= 0) return ESP_OK;
 
-    /* Flush only the dirty Y rows from cache → PSRAM. Each row is
-       MPE_DISPLAY_WIDTH * 2 = 2048 B = 32 cache lines exactly, so
-       the range is naturally cache-line aligned. Massive win vs the
-       full-FB flush: a 26-row status update flushes 52 KB instead
-       of 1.2 MB. */
+    /* The buffer pointer passed to esp_lcd_panel_draw_bitmap must
+       point at a TIGHTLY-PACKED buffer of exactly
+       (x_end-x_start) * (y_end-y_start) * bytes_per_pixel bytes —
+       per the IDF v6.0 docs. NOT a stride-into-full-image.
+       Our scratch is the full 1.2 MB. To pass only a Y band as a
+       "tightly packed" buffer, we (a) restrict the X range to full
+       width so the band IS contiguous in memory, and (b) offset
+       the pointer to row y0. Then bytes
+         scratch[y0*W*2 .. (y0+h)*W*2]
+       are exactly the W*h pixels the driver expects to read.
+       Passing s_scratch without the offset was a bug: the driver
+       was happily reading the FIRST h rows of the scratch and
+       blitting them to position (0, y0) on the panel — which is
+       what produced the "very buggy" partial-rect screenshots. */
     const size_t row_bytes = (size_t)MPE_DISPLAY_WIDTH * 2;
-    uint8_t *flush_start = (uint8_t *)s_scratch + (size_t)y0 * row_bytes;
-    size_t   flush_span  = (size_t)h * row_bytes;
-    esp_cache_msync(flush_start, flush_span,
-                    ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    uint8_t *band = (uint8_t *)s_scratch + (size_t)y0 * row_bytes;
+    size_t   span = (size_t)h * row_bytes;
 
-    /* Tell the driver to copy ONLY the dirty Y band into its
-       internal framebuffer. Driver pulls (0, y0) .. (W, y0+h) from
-       our scratch via DMA — small bands are dramatically less DMA
-       traffic than the full FB every frame. */
+    /* Flush only those rows from cache → PSRAM. */
+    esp_cache_msync(band, span, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
     esp_err_t err = esp_lcd_panel_draw_bitmap(
         s_panel, 0, y0,
         MPE_DISPLAY_WIDTH, y0 + h,
-        s_scratch);
+        band);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "draw_bitmap failed: %s", esp_err_to_name(err));
         return err;
