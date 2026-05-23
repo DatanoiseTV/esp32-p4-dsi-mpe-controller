@@ -39,6 +39,7 @@ static void persist_state_(const mpe_controller *c)
     nvs_set_u8(h, "scale",    (uint8_t)c->scale);
     nvs_set_u8(h, "root_pc",  (uint8_t)c->root_pc);
     nvs_set_u8(h, "pb_range", (uint8_t)c->pb_range_live);
+    nvs_set_u8(h, "pb_mode",  (uint8_t)c->pb_mode);
     nvs_set_i8(h, "r0_oct",   (int8_t)c->row_oct_shift[0]);
     nvs_set_i8(h, "r1_oct",   (int8_t)c->row_oct_shift[1]);
     nvs_commit(h);
@@ -63,6 +64,9 @@ static void load_state_(mpe_controller *c)
         if (u8 == 1 || u8 == 4 || u8 == 12 || u8 == 48) {
             c->pb_range_live = u8;
         }
+    }
+    if (nvs_get_u8(h, "pb_mode", &u8) == ESP_OK && u8 <= 2) {
+        c->pb_mode = u8;
     }
     if (nvs_get_i8(h, "r0_oct", &i8) == ESP_OK && i8 >= -3 && i8 <= 3) {
         c->row_oct_shift[0] = i8;
@@ -121,6 +125,15 @@ const char *mpe_controller_pb_label(const mpe_controller *c)
     case 12: return "octv";
     case 48: return "48 st";
     default: return "?";
+    }
+}
+
+const char *mpe_controller_pb_mode_label(const mpe_controller *c)
+{
+    switch (c->pb_mode) {
+    case 1:  return "Lin";   /* 1 white_w = 1 semi (uniform) */
+    case 2:  return "Wht";   /* 1 white_w = 2 semis (whole-step uniform) */
+    default: return "Key";   /* piecewise key-center anchored */
     }
 }
 
@@ -311,6 +324,12 @@ bool mpe_controller_apply_button(mpe_controller *c, mpe_btn_action a)
         persist_state_(c);
         return true;
     }
+    case MPE_BTN_TOGGLE_PB_MODE:
+        /* Cycle Key → Lin → Wht → Key. */
+        c->pb_mode = (c->pb_mode + 1) % 3;
+        c->layout_version++;
+        persist_state_(c);
+        return true;
     case MPE_BTN_ROW0_OCT_DOWN:
         if (c->row_oct_shift[0] > -3) c->row_oct_shift[0]--;
         break;
@@ -425,16 +444,44 @@ static float chromatic_semitone_at_(const mpe_controller *c, int row, int x_abs)
     return octave_idx * 12.0f + semis_in_oct;
 }
 
-/* Pixel displacement → 14-bit MPE pitch bend, using the piecewise-
-   linear chromatic map above. dx_px is signed displacement from
-   init_x_px (the anchor when the finger landed). */
+/* Pixel displacement → 14-bit MPE pitch bend. Three modes cycled
+   from the on-screen "Bend" chip:
+     0 ("Key", default): piecewise-linear chromatic — the bend
+        tracks actual key centers, so audible pitch matches the
+        visual key spacing exactly even where natural half-steps
+        live (E-F, B-C). Sliding between any two key centers
+        produces their actual musical interval.
+     1 ("Lin"): uniform "1 white-key width = 1 semitone".
+        Original project default. Seaboard-strip feel — slides
+        consistently regardless of which keys you cross, but
+        doesn't match piano-key musical intervals.
+     2 ("Wht"): uniform "1 white-key width = 2 semitones".
+        Treats every white-to-adjacent-white distance as a whole
+        step (the C-D ratio). Useful when you want the bend to
+        match the visual white-key distance audibly — the natural
+        half-step regions (E-F, B-C) become "wider" than musically
+        accurate, but C-D and similar whole-step slides land
+        right on the next white key. */
 static uint16_t pb_from_displacement(const mpe_controller *c,
                                      int init_x, int dx_px, int row)
 {
-    const float init_semi = chromatic_semitone_at_(c, row, init_x);
-    const float cur_semi  = chromatic_semitone_at_(c, row, init_x + dx_px);
-    const float bend_semis = cur_semi - init_semi;
-    const float bend_norm  = bend_semis / (float)c->pb_range_live;
+    float bend_semis;
+    if (c->pb_mode == 1) {
+        const int white_w = c->kb.white_w[clampi(row, 0, MPE_MAX_ROWS - 1)];
+        const float key_w = white_w > 0 ? (float)white_w : 1.0f;
+        bend_semis = (float)dx_px / key_w;
+        (void)init_x;
+    } else if (c->pb_mode == 2) {
+        const int white_w = c->kb.white_w[clampi(row, 0, MPE_MAX_ROWS - 1)];
+        const float key_w = white_w > 0 ? (float)white_w : 1.0f;
+        bend_semis = (float)dx_px * 2.0f / key_w;
+        (void)init_x;
+    } else {
+        const float init_semi = chromatic_semitone_at_(c, row, init_x);
+        const float cur_semi  = chromatic_semitone_at_(c, row, init_x + dx_px);
+        bend_semis = cur_semi - init_semi;
+    }
+    const float bend_norm = bend_semis / (float)c->pb_range_live;
     int v = 0x2000 + (int)(bend_norm * 8192.0f);
     return (uint16_t)clampi(v, 0, 0x3FFF);
 }

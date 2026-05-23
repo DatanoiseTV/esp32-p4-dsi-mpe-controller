@@ -388,6 +388,9 @@ static void render_template(uint16_t *fb,
         case MPE_BTN_CYCLE_ROOT:
             draw_button_chip(&t, b, "Root", mpe_controller_root_name(c));
             break;
+        case MPE_BTN_TOGGLE_PB_MODE:
+            draw_button_chip(&t, b, "Bend", mpe_controller_pb_mode_label(c));
+            break;
         case MPE_BTN_ROW0_OCT_DOWN: draw_button_step(&t, b, "<"); r1_dn = b; break;
         case MPE_BTN_ROW0_OCT_UP:   draw_button_step(&t, b, ">"); r1_up = b; break;
         case MPE_BTN_ROW1_OCT_DOWN: draw_button_step(&t, b, "<"); r2_dn = b; break;
@@ -609,19 +612,22 @@ extern "C" void app_main(void)
     {
         const int16_t by = MPE_UI_BTN_Y;
         const int16_t bh = MPE_UI_BTN_H;
-        const int16_t chip_w = 116;
-        const int16_t step_w = 30;
-        const int16_t row_label_w = 52;
-        const int16_t inter_chip = 8;
-        const int16_t inter_step = 4;
-        const int16_t inter_group = 22;
+        const int16_t chip_w = 100;
+        const int16_t bend_w = 88;
+        const int16_t step_w = 28;
+        const int16_t row_label_w = 46;
+        const int16_t inter_chip = 6;
+        const int16_t inter_step = 3;
+        const int16_t inter_group = 14;
         const int16_t title_w = 210;
 
         int16_t x = title_w;
         const int16_t x_scale  = x;
         x += chip_w + inter_chip;
         const int16_t x_root   = x;
-        x += chip_w + inter_group;
+        x += chip_w + inter_chip;
+        const int16_t x_bend   = x;
+        x += bend_w + inter_group;
 
         const int16_t x_r1_dn  = x;
         x += step_w + inter_step;
@@ -635,12 +641,13 @@ extern "C" void app_main(void)
         const int16_t x_r2_up  = x;
 
         const mpe_button btns[] = {
-            { x_scale,  by, chip_w, bh, MPE_BTN_CYCLE_SCALE   },
-            { x_root,   by, chip_w, bh, MPE_BTN_CYCLE_ROOT    },
-            { x_r1_dn,  by, step_w, bh, MPE_BTN_ROW0_OCT_DOWN },
-            { x_r1_up,  by, step_w, bh, MPE_BTN_ROW0_OCT_UP   },
-            { x_r2_dn,  by, step_w, bh, MPE_BTN_ROW1_OCT_DOWN },
-            { x_r2_up,  by, step_w, bh, MPE_BTN_ROW1_OCT_UP   },
+            { x_scale,  by, chip_w, bh, MPE_BTN_CYCLE_SCALE    },
+            { x_root,   by, chip_w, bh, MPE_BTN_CYCLE_ROOT     },
+            { x_bend,   by, bend_w, bh, MPE_BTN_TOGGLE_PB_MODE },
+            { x_r1_dn,  by, step_w, bh, MPE_BTN_ROW0_OCT_DOWN  },
+            { x_r1_up,  by, step_w, bh, MPE_BTN_ROW0_OCT_UP    },
+            { x_r2_dn,  by, step_w, bh, MPE_BTN_ROW1_OCT_DOWN  },
+            { x_r2_up,  by, step_w, bh, MPE_BTN_ROW1_OCT_UP    },
         };
         mpe_controller_set_buttons(&s_ctrl, btns,
                                    sizeof btns / sizeof btns[0]);

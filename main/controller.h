@@ -91,6 +91,7 @@ typedef enum {
     MPE_BTN_CYCLE_SCALE,
     MPE_BTN_CYCLE_ROOT,
     MPE_BTN_CYCLE_PB,         /* pitch-bend range: 1 / 4 / 12 / 48 semis */
+    MPE_BTN_TOGGLE_PB_MODE,   /* piecewise-linear vs uniform pitch bend */
     MPE_BTN_ROW0_OCT_DOWN,
     MPE_BTN_ROW0_OCT_UP,
     MPE_BTN_ROW1_OCT_DOWN,
@@ -162,6 +163,10 @@ typedef struct {
                                               cycled by the on-screen PB
                                               button. Initialised from
                                               cfg.pb_range_semitones. */
+    int                pb_mode;            /* 0 = piecewise-linear
+                                              (key-center anchored),
+                                              1 = uniform "1 white-key
+                                              width = 1 semitone" */
 
     /* Bumped whenever any of the above changes so the renderer
        knows to rebake the static template. */
@@ -193,6 +198,7 @@ void mpe_controller_set_buttons(mpe_controller *c,
 const char *mpe_controller_scale_name(const mpe_controller *c);
 const char *mpe_controller_root_name (const mpe_controller *c);
 const char *mpe_controller_pb_label  (const mpe_controller *c);
+const char *mpe_controller_pb_mode_label(const mpe_controller *c);
 
 /* Re-build the keyboard with current scale/root/octave shifts. Bumps
    layout_version. Cheap (only the keys[] array is touched). */
