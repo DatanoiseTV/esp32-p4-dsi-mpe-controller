@@ -363,16 +363,31 @@ static int alloc_member_channel(const mpe_controller *c)
     return -1;
 }
 
-/* Pixel displacement → 14-bit MPE pitch bend. 1 white-key of slide
-   = 1 semitone, scaled into the host's configured pb_range. */
+/* Pixel displacement → 14-bit MPE pitch bend.
+ *
+ * The mapping is CHROMATIC: pitch-bend is proportional to actual
+ * pixel distance, scaled so that one chromatic semitone of motion
+ * across the keyboard corresponds to one semitone of bend.
+ *
+ * Earlier this used `1 white-key width = 1 semitone`, which felt
+ * wrong because on a piano-style layout white keys are spaced at
+ * octave/7 pixels but semitones are spaced at octave/12 — e.g.
+ * sliding from C to D (one white-key width = 2 semitones musically)
+ * only produced one semitone of bend, an audible mismatch with
+ * the on-screen key spacing the user expected.
+ *
+ * Now: octave_w = ui_w / octaves_per_row, semitone_w = octave_w / 12.
+ * Slide N pixels → N / semitone_w semitones of bend. The host scales
+ * by pb_range so 1 chromatic position of slide = 1 chromatic
+ * position of audible pitch, end-to-end. */
 static uint16_t pb_from_displacement(const mpe_controller *c,
                                      int dx_px, int row)
 {
-    const float key_w = (float)c->kb.white_w[clampi(row, 0, MPE_MAX_ROWS - 1)];
-    const float bend_semis = (float)dx_px / key_w;
-    /* Live range from the on-screen PB cycle button, not cfg.
-       Smaller range = same finger motion produces bigger 14-bit
-       deltas = host pitch bends more aggressively. */
+    (void)row;
+    const float octave_w = (float)c->cfg.ui_w /
+                           (float)c->cfg.octaves_per_row;
+    const float semitone_w = octave_w / 12.0f;
+    const float bend_semis = (float)dx_px / semitone_w;
     const float bend_norm  = bend_semis / (float)c->pb_range_live;
     int v = 0x2000 + (int)(bend_norm * 8192.0f);
     return (uint16_t)clampi(v, 0, 0x3FFF);
