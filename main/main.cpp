@@ -758,10 +758,13 @@ extern "C" void app_main(void)
         (void)s_force_full_restore;
         (void)ui;
 
-        /* Single-FB + partial restore. The full-template-per-frame
-           variant burns ~3 MB/frame of PSRAM bandwidth and tops out
-           at 13 FPS; restoring only the small dirty bbox keeps the
-           PSRAM hot path manageable. */
+        /* Take the paint lock. If the screenshot endpoint is in the
+           middle of sending a BMP, this blocks until the send
+           completes — guaranteeing the FB the screenshot captured
+           doesn't get repainted out from under it (which would have
+           shown half-painted dynamics in the output image). */
+        mpe_display_lock();
+
         uint16_t *back = mpe_display_back_buffer();
         mp_target target = { back, MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT };
 
@@ -859,6 +862,8 @@ extern "C" void app_main(void)
            our local index that selects which prev_dirty entry to
            use next frame. */
         s_back_local ^= 1;
+
+        mpe_display_unlock();
 
         frames++;
         const int64_t now = esp_timer_get_time();

@@ -78,24 +78,29 @@ static esp_err_t screenshot_get_handler(httpd_req_t *req)
     /* No caching — every fetch is the live framebuffer. */
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 
+    /* Hold the paint lock for the entire send. While this is held
+       the render loop blocks at the start of each frame, so the
+       front-buffer pixels we're reading don't change underneath us
+       and the BMP captures a single consistent frame. The visible
+       cost is a ~1 s UI freeze while the screenshot ships over
+       WiFi — acceptable trade-off vs torn / half-painted output. */
+    mpe_display_lock();
+
     uint8_t hdr[BMP_HEADER_SIZE];
     build_bmp_header(hdr, MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT);
     esp_err_t err = httpd_resp_send_chunk(req, (const char *)hdr,
                                           BMP_HEADER_SIZE);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        mpe_display_unlock();
+        return err;
+    }
 
-    /* Read whichever buffer the panel is currently scanning out.
-       Invalidate cache first so we see pixels actually in PSRAM (the
-       front buffer was last CPU-written one or more frames ago and
-       DMA writes since have bypassed cache). */
     uint16_t *fb = mpe_display_front_buffer();
     if (!fb) {
         httpd_resp_send_chunk(req, NULL, 0);
+        mpe_display_unlock();
         return ESP_FAIL;
     }
-    /* FB pointer is at the start of a panel-driver allocation
-       (64-byte aligned) and FB_BYTES = 1228800 = multiple of 64,
-       so no UNALIGNED flag needed (IDF rejects it for M2C anyway). */
     esp_cache_msync(fb, FB_BYTES, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
 
     /* Chunked send so we don't need a full FB_BYTES buffer in RAM.
@@ -110,12 +115,14 @@ static esp_err_t screenshot_get_handler(httpd_req_t *req)
         esp_err_t e = httpd_resp_send_chunk(req, (const char *)p, n);
         if (e != ESP_OK) {
             httpd_resp_send_chunk(req, NULL, 0);
+            mpe_display_unlock();
             return e;
         }
         p    += n;
         left -= n;
     }
     httpd_resp_send_chunk(req, NULL, 0);   /* end chunked response */
+    mpe_display_unlock();
     ESP_LOGI(TAG, "screenshot served (%u bytes)",
              (unsigned)(BMP_HEADER_SIZE + FB_BYTES));
     return ESP_OK;

@@ -73,6 +73,7 @@ static esp_lcd_panel_handle_t    s_panel     = NULL;
 static uint16_t                 *s_fbs[2]    = { NULL, NULL };
 static int                       s_back_idx  = 0;
 static SemaphoreHandle_t         s_vsync_sem = NULL;
+static SemaphoreHandle_t         s_paint_lock = NULL;
 static bool                      s_bl_inited = false;
 static i2c_master_bus_handle_t   s_i2c_bus   = NULL;
 static ppa_client_handle_t       s_ppa_srm   = NULL;
@@ -230,6 +231,8 @@ esp_err_t mpe_display_init(void)
 
     s_vsync_sem = xSemaphoreCreateBinary();
     if (!s_vsync_sem) return ESP_ERR_NO_MEM;
+    s_paint_lock = xSemaphoreCreateMutex();
+    if (!s_paint_lock) return ESP_ERR_NO_MEM;
 
     esp_lcd_dpi_panel_event_callbacks_t cbs = {};
     cbs.on_color_trans_done = swap_done_cb_;
@@ -437,4 +440,14 @@ esp_err_t mpe_display_present_y(int y0, int h)
 esp_err_t mpe_display_present(void)
 {
     return mpe_display_present_y(0, MPE_DISPLAY_HEIGHT);
+}
+
+void mpe_display_lock(void)
+{
+    if (s_paint_lock) xSemaphoreTake(s_paint_lock, portMAX_DELAY);
+}
+
+void mpe_display_unlock(void)
+{
+    if (s_paint_lock) xSemaphoreGive(s_paint_lock);
 }

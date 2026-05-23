@@ -54,6 +54,15 @@ esp_err_t   mpe_display_present(void);
    the back buffer; clipping is done internally. */
 esp_err_t   mpe_display_present_y(int y0, int h);
 
+/* Paint-side mutex. The render loop holds this around its
+   paint + present block; the screenshot endpoint takes it for the
+   full duration of the BMP send so no buffer swap happens
+   mid-capture (would produce a torn / partially-painted image).
+   Blocking — render task simply pauses for the ~1 second the
+   screenshot takes to ship over WiFi. */
+void        mpe_display_lock(void);
+void        mpe_display_unlock(void);
+
 esp_err_t   mpe_display_set_backlight(int pct);
 
 /* Returns the I2C master bus that the touch controller shares with
