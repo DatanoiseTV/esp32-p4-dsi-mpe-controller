@@ -50,35 +50,28 @@ static const char *TAG = "display";
 #define DPHY_LDO_VOLTAGE_MV  2500
 #define DSI_LANES            2
 
-/* Architecture note (post esp-bsp issue #581 finding):
+/* Architecture (deep-dive findings from the IDF v6.0 source):
  *
- *   esp_lcd_dpi_panel + num_fbs=2 is broken on IDF v6.0 — the
- *   callback dispatcher doesn't fire reliably and the cache-flush
- *   path doesn't handle two buffers. Symptoms in our case were a
- *   permanent vsync-wait timeout (FPS pinned at 10) and ghost
- *   artifacts that no amount of dirty-rect bookkeeping could clean
- *   up reliably.
+ *   esp_lcd_dpi_panel_draw_bitmap has a FAST path that just does
+ *   esp_cache_msync (no copy) when the buffer pointer is inside
+ *   one of the driver's internal framebuffers, and a SLOW path
+ *   that does a CPU memcpy row-by-row from user buffer into the
+ *   FB otherwise — at ~30 MB/s effective PSRAM CPU memcpy that
+ *   slow path was the 17 FPS floor we kept hitting.
  *
- *   The working pattern from PavelMostovoy/ESP32-P4-minimal-DSI-demo
- *   (and Espressif's own ppa_dsi example) is single-FB:
- *     - Driver owns ONE internal framebuffer (num_fbs = 1).
- *     - We allocate our own scratch RAM buffer.
- *     - Each frame we paint into the scratch, then call
- *       esp_lcd_panel_draw_bitmap(panel, 0,0,W,H, scratch). The
- *       driver DMA-copies our scratch into its internal FB and the
- *       on_color_trans_done callback fires reliably.
- *     - We wait on a binary semaphore signalled from the callback
- *       so the next paint can begin without tearing.
+ *   With num_fbs=2 the driver also atomically swaps the active
+ *   scan buffer to whichever FB we just drew into → no tearing,
+ *   because DSI is scanning the OTHER one while we paint.
  *
- *   That's how this file is structured below. The old double-FB
- *   API surface (back / front buffer accessors) is retained for
- *   source compatibility, but now both return the same scratch
- *   buffer — there is no front/back distinction. */
+ *   So: num_fbs=2, retrieve both FB pointers, alternate painting
+ *   into them, pass the FB pointer to draw_bitmap → fast path
+ *   triggers + atomic swap → flicker-free AND fast. */
 static esp_ldo_channel_handle_t  s_phy_pwr   = NULL;
 static esp_lcd_dsi_bus_handle_t  s_bus       = NULL;
 static esp_lcd_panel_io_handle_t s_io        = NULL;
 static esp_lcd_panel_handle_t    s_panel     = NULL;
-static uint16_t                 *s_scratch   = NULL;   /* our paint buf */
+static uint16_t                 *s_fbs[2]    = { NULL, NULL };
+static int                       s_back_idx  = 0;
 static SemaphoreHandle_t         s_vsync_sem = NULL;
 static bool                      s_bl_inited = false;
 static i2c_master_bus_handle_t   s_i2c_bus   = NULL;
@@ -192,7 +185,8 @@ esp_err_t mpe_display_init(void)
 
     esp_lcd_dpi_panel_config_t dpi_cfg =
         EK79007_1024_600_PANEL_60HZ_CONFIG_CF(LCD_COLOR_FMT_RGB565);
-    dpi_cfg.num_fbs            = 1;            /* single internal FB */
+    dpi_cfg.num_fbs            = 2;            /* dual internal FBs
+                                                  for tear-free swap */
     dpi_cfg.dpi_clock_freq_mhz = CONFIG_DISP_DPI_CLOCK_FREQ_MHZ;
 
     ek79007_vendor_config_t vendor = {};
@@ -213,29 +207,26 @@ esp_err_t mpe_display_init(void)
 
     esp_lcd_panel_disp_on_off(s_panel, true);
 
-    /* CRITICAL discovery — reading the IDF v6.0 esp_lcd_panel_dpi.c
-       source for esp_lcd_panel_draw_bitmap: the driver has a fast
-       path that does ONLY a cache flush (no copy) if our buffer
-       pointer is one of the driver's internal framebuffers. Any
-       other buffer triggers a full CPU memcpy from user buffer to
-       internal FB, row by row — at ~30 MB/s PSRAM throughput, a
-       1024×600 frame is ~40 ms.
-       So we DON'T allocate a separate scratch — we retrieve the
-       driver's own framebuffer pointer and paint directly into it.
-       draw_bitmap then detects the buffer == the FB and skips the
-       copy entirely. */
+    /* Retrieve both internal framebuffer pointers. Painting INTO
+       one of these triggers the driver's fast path on draw_bitmap
+       (no per-frame copy) and an atomic scan-buffer swap so we
+       never paint on the FB the DSI is actively scanning out — the
+       num_fbs=1 single-buffer flicker we just had. */
     const size_t fb_bytes =
         (size_t)MPE_DISPLAY_WIDTH * MPE_DISPLAY_HEIGHT * 2;
-    void *internal_fb = NULL;
+    void *fb0 = NULL, *fb1 = NULL;
     ESP_RETURN_ON_ERROR(
-        esp_lcd_dpi_panel_get_frame_buffer(s_panel, 1, &internal_fb),
+        esp_lcd_dpi_panel_get_frame_buffer(s_panel, 2, &fb0, &fb1),
         TAG, "get_frame_buffer");
-    s_scratch = (uint16_t *)internal_fb;
-    if (!s_scratch) {
-        ESP_LOGE(TAG, "internal FB pointer NULL");
+    s_fbs[0] = (uint16_t *)fb0;
+    s_fbs[1] = (uint16_t *)fb1;
+    if (!s_fbs[0] || !s_fbs[1]) {
+        ESP_LOGE(TAG, "panel returned NULL framebuffer(s)");
         return ESP_ERR_INVALID_STATE;
     }
-    memset(s_scratch, 0, fb_bytes);
+    memset(s_fbs[0], 0, fb_bytes);
+    memset(s_fbs[1], 0, fb_bytes);
+    s_back_idx = 0;
 
     s_vsync_sem = xSemaphoreCreateBinary();
     if (!s_vsync_sem) return ESP_ERR_NO_MEM;
@@ -246,19 +237,17 @@ esp_err_t mpe_display_init(void)
         esp_lcd_dpi_panel_register_event_callbacks(s_panel, &cbs, NULL),
         TAG, "register_event_callbacks");
 
-    /* Kick off scanout. Since s_scratch IS the internal FB, this
-       triggers only the fast-path cache flush — no per-frame
-       memcpy. The on_color_trans_done fires synchronously from
-       inside draw_bitmap. */
-    esp_cache_msync(s_scratch, fb_bytes,
+    /* Kick off scanout from fb0; we'll paint fb1 first. */
+    esp_cache_msync(s_fbs[0], fb_bytes,
                     ESP_CACHE_MSYNC_FLAG_DIR_C2M |
                     ESP_CACHE_MSYNC_FLAG_UNALIGNED);
     ESP_RETURN_ON_ERROR(
         esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
                                   MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT,
-                                  s_scratch),
+                                  s_fbs[0]),
         TAG, "initial draw_bitmap");
     xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(100));
+    s_back_idx = 1;   /* fb[0] is now showing; we paint fb[1] next */
 
     /* Register a PPA SRM client so the app can DMA per-rect template
        restores instead of doing them on the CPU. Failure here is
@@ -290,19 +279,14 @@ esp_err_t mpe_display_init(void)
 
 uint16_t *mpe_display_back_buffer(void)
 {
-    /* In single-FB mode there's no front/back distinction — we
-       paint into the same scratch buffer every frame. Returning it
-       here keeps the call-site API identical. */
-    return s_scratch;
+    return s_fbs[s_back_idx];
 }
 
 uint16_t *mpe_display_front_buffer(void)
 {
-    /* For the screenshot endpoint: the scratch holds the most
-       recently-painted frame (the driver's internal FB has the
-       same content, just one swap-cycle delayed). Reading the
-       scratch is equivalent and avoids an extra cache invalidate. */
-    return s_scratch;
+    /* Whichever buffer we just showed last (= NOT the one we're
+       about to paint). */
+    return s_fbs[s_back_idx ^ 1];
 }
 
 void mpe_display_rect_copy(uint16_t *dst, const uint16_t *src,
@@ -410,33 +394,24 @@ void mpe_display_flush_writes(void *buf, size_t bytes)
 
 esp_err_t mpe_display_present_y(int y0, int h)
 {
-    if (!s_panel || !s_vsync_sem || !s_scratch) return ESP_ERR_INVALID_STATE;
+    if (!s_panel || !s_vsync_sem) return ESP_ERR_INVALID_STATE;
 
     /* Clip + validate. */
     if (y0 < 0) { h += y0; y0 = 0; }
     if (y0 + h > MPE_DISPLAY_HEIGHT) h = MPE_DISPLAY_HEIGHT - y0;
     if (h <= 0) return ESP_OK;
 
-    /* The buffer pointer passed to esp_lcd_panel_draw_bitmap must
-       point at a TIGHTLY-PACKED buffer of exactly
-       (x_end-x_start) * (y_end-y_start) * bytes_per_pixel bytes —
-       per the IDF v6.0 docs. NOT a stride-into-full-image.
-       Our scratch is the full 1.2 MB. To pass only a Y band as a
-       "tightly packed" buffer, we (a) restrict the X range to full
-       width so the band IS contiguous in memory, and (b) offset
-       the pointer to row y0. Then bytes
-         scratch[y0*W*2 .. (y0+h)*W*2]
-       are exactly the W*h pixels the driver expects to read.
-       Passing s_scratch without the offset was a bug: the driver
-       was happily reading the FIRST h rows of the scratch and
-       blitting them to position (0, y0) on the panel — which is
-       what produced the "very buggy" partial-rect screenshots. */
+    /* color_data must be a tightly-packed buffer of exactly
+       (x1-x0)*(y1-y0)*bpp bytes — NOT stride-into-full-image. The
+       fast path checks if the pointer is within any internal FB,
+       so we need to pass the correctly-offset pointer that's still
+       inside that FB allocation. fb + y0*W*2 is exactly the start
+       of row y0 in our back buffer; the (W * h) pixels from there
+       are tightly packed in memory because we span the full X
+       width. */
+    uint16_t *back = s_fbs[s_back_idx];
     const size_t row_bytes = (size_t)MPE_DISPLAY_WIDTH * 2;
-    uint8_t *band = (uint8_t *)s_scratch + (size_t)y0 * row_bytes;
-    size_t   span = (size_t)h * row_bytes;
-
-    /* Flush only those rows from cache → PSRAM. */
-    esp_cache_msync(band, span, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    uint8_t *band = (uint8_t *)back + (size_t)y0 * row_bytes;
 
     esp_err_t err = esp_lcd_panel_draw_bitmap(
         s_panel, 0, y0,
@@ -447,7 +422,14 @@ esp_err_t mpe_display_present_y(int y0, int h)
         return err;
     }
 
+    /* Driver's fast path already did the cache flush on the band
+       AND atomically swapped the active scan buffer to our back.
+       on_color_trans_done fires inline; this wait is a sanity
+       check that completes immediately. */
     xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(100));
+
+    /* Flip — next frame paints the buffer that's now off-screen. */
+    s_back_idx ^= 1;
     return ESP_OK;
 }
 

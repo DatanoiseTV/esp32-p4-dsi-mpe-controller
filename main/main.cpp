@@ -79,25 +79,19 @@ static uint16_t              *s_template = nullptr;
 static const size_t           kFbBytes = (size_t)MPE_DISPLAY_WIDTH *
                                           MPE_DISPLAY_HEIGHT * 2;
 
-/* --- Dirty-rect partial restore (single-FB version) -------------- *
+/* --- Dirty-rect partial restore (num_fbs=2 fast-path) ------------ *
  *
- * Full-screen template copy every frame burns ~3 MB of PSRAM
- * bandwidth (template→scratch PPA + driver scratch→internal-FB
- * DMA), pinning FPS to ~13. The dynamic surface area (status row +
- * 5 finger dots + key activity zones) is much smaller. We:
- *   1. Compute cur dirty rects from snap state.
- *   2. Restore (template → scratch) the UNION of prev_dirty
- *      (where we wrote last frame) + cur (where we're about to
- *      write).
- *   3. Render dynamics into those areas.
- *   4. Save cur for next frame's restore.
- *
- * Single buffer = no per-buffer history, no force-restore bursts. */
+ * The back buffer alternates each frame (driver swaps which FB is
+ * being scanned out). The buffer we're about to paint has dynamics
+ * from TWO frames ago that need restoring before we draw the new
+ * frame's dynamics. So per-buffer prev_dirty: prev_dirty[idx] is
+ * what we WROTE on this buffer the previous time it was back. */
 typedef struct { int16_t x, y, w, h; } rect_t;
 #define MAX_DIRTY_RECTS 24
 typedef struct { rect_t r[MAX_DIRTY_RECTS]; int n; } dirty_list_t;
 
-static dirty_list_t s_prev_dirty = {};
+static dirty_list_t s_prev_dirty[2] = {};
+static int          s_back_local    = 0;   /* mirrors driver's idx */
 
 static inline void rect_clip_(rect_t *r)
 {
@@ -819,8 +813,9 @@ extern "C" void app_main(void)
             if (r->x + r->w  > bbox_x1) bbox_x1 = r->x + r->w;
             if (r->y + r->h  > bbox_y1) bbox_y1 = r->y + r->h;
         };
-        for (int i = 0; i < s_prev_dirty.n; i++) bbox_extend(&s_prev_dirty.r[i]);
-        for (int i = 0; i < cur.n;          i++) bbox_extend(&cur.r[i]);
+        const dirty_list_t *my_prev = &s_prev_dirty[s_back_local];
+        for (int i = 0; i < my_prev->n; i++) bbox_extend(&my_prev->r[i]);
+        for (int i = 0; i < cur.n;      i++) bbox_extend(&cur.r[i]);
 
         if (bbox_x1 > bbox_x0 && bbox_y1 > bbox_y0) {
             mpe_display_rect_copy(back, s_template,
@@ -828,7 +823,7 @@ extern "C" void app_main(void)
                                   bbox_x1 - bbox_x0,
                                   bbox_y1 - bbox_y0);
         }
-        s_prev_dirty = cur;
+        s_prev_dirty[s_back_local] = cur;
 
         mpe_ui_status st = {};
         st.wifi_ip        = wifi_ip;
@@ -849,6 +844,12 @@ extern "C" void app_main(void)
         } else {
             mpe_display_present_y(0, 1);
         }
+
+        /* Mirror the driver's buffer-flip so prev_dirty stays in
+           lockstep — present() flipped its s_back_idx, so we flip
+           our local index that selects which prev_dirty entry to
+           use next frame. */
+        s_back_local ^= 1;
 
         frames++;
         const int64_t now = esp_timer_get_time();
