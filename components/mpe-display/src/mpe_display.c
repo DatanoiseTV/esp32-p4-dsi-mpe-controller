@@ -211,22 +211,31 @@ esp_err_t mpe_display_init(void)
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG, "reset");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel),  TAG, "init");
 
-    /* Explicit display-on — the demo does this and apparently it's
-       not implicit on panel_init for all panels. */
     esp_lcd_panel_disp_on_off(s_panel, true);
 
-    /* Allocate our scratch paint buffer. MALLOC_CAP_DMA flag matters:
-       the driver passes the pointer to the DMA descriptor, and the
-       region must be DMA-capable. SPIRAM caps adds PSRAM (the only
-       place a 1.2 MB buffer fits). */
+    /* CRITICAL discovery — reading the IDF v6.0 esp_lcd_panel_dpi.c
+       source for esp_lcd_panel_draw_bitmap: the driver has a fast
+       path that does ONLY a cache flush (no copy) if our buffer
+       pointer is one of the driver's internal framebuffers. Any
+       other buffer triggers a full CPU memcpy from user buffer to
+       internal FB, row by row — at ~30 MB/s PSRAM throughput, a
+       1024×600 frame is ~40 ms.
+       So we DON'T allocate a separate scratch — we retrieve the
+       driver's own framebuffer pointer and paint directly into it.
+       draw_bitmap then detects the buffer == the FB and skips the
+       copy entirely. */
     const size_t fb_bytes =
         (size_t)MPE_DISPLAY_WIDTH * MPE_DISPLAY_HEIGHT * 2;
-    s_scratch = (uint16_t *)heap_caps_aligned_calloc(
-        64, 1, fb_bytes, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
+    void *internal_fb = NULL;
+    ESP_RETURN_ON_ERROR(
+        esp_lcd_dpi_panel_get_frame_buffer(s_panel, 1, &internal_fb),
+        TAG, "get_frame_buffer");
+    s_scratch = (uint16_t *)internal_fb;
     if (!s_scratch) {
-        ESP_LOGE(TAG, "scratch alloc failed (%zu B)", fb_bytes);
-        return ESP_ERR_NO_MEM;
+        ESP_LOGE(TAG, "internal FB pointer NULL");
+        return ESP_ERR_INVALID_STATE;
     }
+    memset(s_scratch, 0, fb_bytes);
 
     s_vsync_sem = xSemaphoreCreateBinary();
     if (!s_vsync_sem) return ESP_ERR_NO_MEM;
@@ -237,9 +246,10 @@ esp_err_t mpe_display_init(void)
         esp_lcd_dpi_panel_register_event_callbacks(s_panel, &cbs, NULL),
         TAG, "register_event_callbacks");
 
-    /* Initial draw_bitmap of the cleared scratch — gets the panel's
-       internal scanout going. Subsequent presents fire callbacks
-       reliably in single-FB mode. */
+    /* Kick off scanout. Since s_scratch IS the internal FB, this
+       triggers only the fast-path cache flush — no per-frame
+       memcpy. The on_color_trans_done fires synchronously from
+       inside draw_bitmap. */
     esp_cache_msync(s_scratch, fb_bytes,
                     ESP_CACHE_MSYNC_FLAG_DIR_C2M |
                     ESP_CACHE_MSYNC_FLAG_UNALIGNED);
@@ -248,8 +258,6 @@ esp_err_t mpe_display_init(void)
                                   MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT,
                                   s_scratch),
         TAG, "initial draw_bitmap");
-    /* That first draw triggers the first on_color_trans_done; drain
-       it so the very first present() doesn't see a stale signal. */
     xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(100));
 
     /* Register a PPA SRM client so the app can DMA per-rect template
