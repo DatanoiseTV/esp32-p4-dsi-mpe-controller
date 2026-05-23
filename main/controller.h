@@ -92,11 +92,25 @@ typedef enum {
     MPE_BTN_CYCLE_ROOT,
     MPE_BTN_CYCLE_PB,         /* pitch-bend range: 1 / 4 / 12 / 48 semis */
     MPE_BTN_TOGGLE_PB_MODE,   /* piecewise-linear vs uniform pitch bend */
+    MPE_BTN_CYCLE_LAYOUT,     /* Piano / Grid / Slide */
     MPE_BTN_ROW0_OCT_DOWN,
     MPE_BTN_ROW0_OCT_UP,
     MPE_BTN_ROW1_OCT_DOWN,
     MPE_BTN_ROW1_OCT_UP,
 } mpe_btn_action;
+
+/* Available surface layouts. Piano is the dual-row keyboard we
+   shipped with; Grid is an isomorphic cell layout (LinnStrument-
+   style, each row tuned a perfect fourth above the one below);
+   Slide is a continuous ribbon (Bebot-style) where any touch
+   position picks a semitone, then horizontal motion bends + Y
+   and pressure drive expression. */
+typedef enum {
+    MPE_LAYOUT_PIANO = 0,
+    MPE_LAYOUT_GRID,
+    MPE_LAYOUT_SLIDE,
+    MPE_NUM_LAYOUTS,
+} mpe_layout_id;
 
 typedef struct {
     int16_t        x, y, w, h;
@@ -167,6 +181,7 @@ typedef struct {
                                               (key-center anchored),
                                               1 = uniform "1 white-key
                                               width = 1 semitone" */
+    mpe_layout_id      layout;             /* Piano / Grid / Slide */
 
     /* Bumped whenever any of the above changes so the renderer
        knows to rebake the static template. */
@@ -199,6 +214,7 @@ const char *mpe_controller_scale_name(const mpe_controller *c);
 const char *mpe_controller_root_name (const mpe_controller *c);
 const char *mpe_controller_pb_label  (const mpe_controller *c);
 const char *mpe_controller_pb_mode_label(const mpe_controller *c);
+const char *mpe_controller_layout_name(const mpe_controller *c);
 
 /* Re-build the keyboard with current scale/root/octave shifts. Bumps
    layout_version. Cheap (only the keys[] array is touched). */

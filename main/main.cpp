@@ -276,6 +276,67 @@ static void render_template(uint16_t *fb,
         "C","C#","D","D#","E","F","F#","G","G#","A","A#","B"
     };
 
+    /* Non-piano layouts render keys as flat cells rather than the
+       white/black piano look. They share the cell-drawing code
+       below; the piano path falls through to the two-pass
+       (white + black) renderer beneath. */
+    if (c->layout == MPE_LAYOUT_GRID ||
+        c->layout == MPE_LAYOUT_SLIDE) {
+        for (int i = 0; i < c->kb.n_keys; i++) {
+            const mpe_key *k = &c->kb.keys[i];
+            const int x = k->x, y = k->y, w = k->w, h = k->h;
+            const bool in_scale = k->in_scale;
+            const bool is_root  = (k->pc == c->root_pc);
+
+            uint8_t tr, tg, tb, dr, dg, db;
+            if (is_root) {
+                tr=0xc8; tg=0xa8; tb=0x68;
+                dr=0x68; dg=0x50; db=0x28;
+            } else if (in_scale) {
+                tr=0x3a; tg=0x44; tb=0x58;
+                dr=0x14; dg=0x18; db=0x22;
+            } else {
+                tr=0x18; tg=0x1c; tb=0x24;
+                dr=0x08; dg=0x09; db=0x0c;
+            }
+            const int ix = x + 1, iy = y + 1, iw = w - 2, ih = h - 2;
+            mp_gradient_v(&t, ix, iy, iw, ih, tr, tg, tb, dr, dg, db);
+            /* Subtle bevels. */
+            mp_hline_a(&t, ix, iy,           iw, 0xff,0xff,0xff, 28);
+            mp_hline_a(&t, ix, iy + ih - 1,  iw, 0x00,0x00,0x00, 160);
+            mp_vline_a(&t, x,          y, h, 0x00,0x00,0x00, 180);
+            mp_vline_a(&t, x + w - 1,  y, h, 0x00,0x00,0x00, 180);
+
+            /* Note label on every cell (Grid is information-dense
+               and the player benefits from seeing the actual notes
+               under the fingers). For Slide we still label so the
+               player can target a specific pitch. */
+            if (h >= 28 && w >= 18) {
+                char buf[8];
+                if (is_root) {
+                    snprintf(buf, sizeof buf, "%s%d",
+                             kNames[k->pc], (k->midi_note / 12) - 1);
+                } else {
+                    snprintf(buf, sizeof buf, "%s", kNames[k->pc]);
+                }
+                const int sz = (h >= 56) ? 14 : 11;
+                const int lw = mpe_font_text_width_px(buf, -1, sz);
+                if (lw <= iw - 4) {
+                    const uint16_t fg = is_root
+                        ? mp_rgb565(0x40, 0x2c, 0x10)
+                        : (in_scale
+                            ? mp_rgb565(0xc8, 0xd4, 0xe0)
+                            : mp_rgb565(0x40, 0x46, 0x50));
+                    mpe_font_draw_text(t.fb, t.width, t.height,
+                                       x + (w - lw) / 2,
+                                       y + h - sz - 4,
+                                       buf, -1, sz, fg);
+                }
+            }
+        }
+        goto draw_top_bar_;
+    }
+
     for (int pass = 0; pass < 2; pass++) {
         const bool want_black = (pass == 1);
         for (int i = 0; i < c->kb.n_keys; i++) {
@@ -365,6 +426,7 @@ static void render_template(uint16_t *fb,
         }
     }
 
+draw_top_bar_:
     /* ----- Top-bar title + chips ----- */
     /* Big "MPE" + small "controller" subtitle, left-aligned. */
     mpe_font_draw_text(t.fb, t.width, t.height, 14, 6,
@@ -390,6 +452,9 @@ static void render_template(uint16_t *fb,
             break;
         case MPE_BTN_TOGGLE_PB_MODE:
             draw_button_chip(&t, b, "Bend", mpe_controller_pb_mode_label(c));
+            break;
+        case MPE_BTN_CYCLE_LAYOUT:
+            draw_button_chip(&t, b, "View", mpe_controller_layout_name(c));
             break;
         case MPE_BTN_ROW0_OCT_DOWN: draw_button_step(&t, b, "<"); r1_dn = b; break;
         case MPE_BTN_ROW0_OCT_UP:   draw_button_step(&t, b, ">"); r1_up = b; break;
@@ -612,16 +677,19 @@ extern "C" void app_main(void)
     {
         const int16_t by = MPE_UI_BTN_Y;
         const int16_t bh = MPE_UI_BTN_H;
-        const int16_t chip_w = 100;
-        const int16_t bend_w = 88;
-        const int16_t step_w = 28;
-        const int16_t row_label_w = 46;
-        const int16_t inter_chip = 6;
+        const int16_t view_w = 92;
+        const int16_t chip_w = 92;
+        const int16_t bend_w = 80;
+        const int16_t step_w = 26;
+        const int16_t row_label_w = 42;
+        const int16_t inter_chip = 5;
         const int16_t inter_step = 3;
-        const int16_t inter_group = 14;
-        const int16_t title_w = 210;
+        const int16_t inter_group = 10;
+        const int16_t title_w = 196;
 
         int16_t x = title_w;
+        const int16_t x_view   = x;
+        x += view_w + inter_chip;
         const int16_t x_scale  = x;
         x += chip_w + inter_chip;
         const int16_t x_root   = x;
@@ -641,6 +709,7 @@ extern "C" void app_main(void)
         const int16_t x_r2_up  = x;
 
         const mpe_button btns[] = {
+            { x_view,   by, view_w, bh, MPE_BTN_CYCLE_LAYOUT   },
             { x_scale,  by, chip_w, bh, MPE_BTN_CYCLE_SCALE    },
             { x_root,   by, chip_w, bh, MPE_BTN_CYCLE_ROOT     },
             { x_bend,   by, bend_w, bh, MPE_BTN_TOGGLE_PB_MODE },

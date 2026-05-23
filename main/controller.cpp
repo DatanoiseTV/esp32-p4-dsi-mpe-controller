@@ -40,6 +40,7 @@ static void persist_state_(const mpe_controller *c)
     nvs_set_u8(h, "root_pc",  (uint8_t)c->root_pc);
     nvs_set_u8(h, "pb_range", (uint8_t)c->pb_range_live);
     nvs_set_u8(h, "pb_mode",  (uint8_t)c->pb_mode);
+    nvs_set_u8(h, "layout",   (uint8_t)c->layout);
     nvs_set_i8(h, "r0_oct",   (int8_t)c->row_oct_shift[0]);
     nvs_set_i8(h, "r1_oct",   (int8_t)c->row_oct_shift[1]);
     nvs_commit(h);
@@ -67,6 +68,9 @@ static void load_state_(mpe_controller *c)
     }
     if (nvs_get_u8(h, "pb_mode", &u8) == ESP_OK && u8 <= 2) {
         c->pb_mode = u8;
+    }
+    if (nvs_get_u8(h, "layout", &u8) == ESP_OK && u8 < MPE_NUM_LAYOUTS) {
+        c->layout = (mpe_layout_id)u8;
     }
     if (nvs_get_i8(h, "r0_oct", &i8) == ESP_OK && i8 >= -3 && i8 <= 3) {
         c->row_oct_shift[0] = i8;
@@ -137,6 +141,15 @@ const char *mpe_controller_pb_mode_label(const mpe_controller *c)
     }
 }
 
+const char *mpe_controller_layout_name(const mpe_controller *c)
+{
+    switch (c->layout) {
+    case MPE_LAYOUT_GRID:  return "Grid";
+    case MPE_LAYOUT_SLIDE: return "Slide";
+    default:               return "Piano";
+    }
+}
+
 /* ---- keyboard build ---------------------------------------------- */
 
 static int midi_for(int octave_spn, int pc)
@@ -146,13 +159,11 @@ static int midi_for(int octave_spn, int pc)
     return (octave_spn + 1) * 12 + pc;
 }
 
-void mpe_controller_rebuild_keyboard(mpe_controller *c)
+static void build_piano_(mpe_controller *c)
 {
     static const int kWhitePc[7]      = {0, 2, 4, 5, 7, 9, 11};
     static const int kBlackPc[5]      = {1, 3, 6, 8, 10};
-    static const int kBlackAfter[5]   = {0, 1, 3, 4, 5}; /* whites the
-                                                            black sits
-                                                            right of */
+    static const int kBlackAfter[5]   = {0, 1, 3, 4, 5};
     const mpe_controller_cfg *cfg = &c->cfg;
     mpe_keyboard *kb = &c->kb;
     kb->n_keys = 0;
@@ -171,16 +182,11 @@ void mpe_controller_rebuild_keyboard(mpe_controller *c)
         kb->black_w  [r] = black_w;
         kb->black_h  [r] = black_h;
 
-        /* Octave for THIS row. row 0 = top of screen = higher notes.
-           Bottom row (last) starts at cfg.lowest_octave.
-           Row above adds row_octave_offset per row of distance. */
         const int rows_from_bottom = (cfg->rows - 1) - r;
         const int row_base_octave  = cfg->lowest_octave
                                      + rows_from_bottom * cfg->row_octave_offset
                                      + c->row_oct_shift[r];
 
-        /* Whites first, then blacks — the array order is also the
-           render order (whites drawn first as the base layer). */
         for (int oct = 0; oct < cfg->octaves_per_row; oct++) {
             for (int wk = 0; wk < 7; wk++) {
                 if (kb->n_keys >= MPE_MAX_KEYS) break;
@@ -216,7 +222,101 @@ void mpe_controller_rebuild_keyboard(mpe_controller *c)
             }
         }
     }
+}
 
+/* Grid (LinnStrument-style) layout. An isomorphic cell grid:
+     - cols × rows of equal-sized cells
+     - midi note = base + row_step * (rows-1-r) + col
+     - row_step = 5 semitones (perfect 4th), the LinnStrument default
+   The top row is the highest pitch; columns increase left to right
+   by 1 semitone. Two adjacent rows transpose by a perfect 4th. */
+static void build_grid_(mpe_controller *c)
+{
+    const mpe_controller_cfg *cfg = &c->cfg;
+    mpe_keyboard *kb = &c->kb;
+    kb->n_keys = 0;
+
+    const int cols = 16;
+    const int rows = 8;
+    const int row_step = 5;
+    const int base_note = midi_for(cfg->lowest_octave + c->row_oct_shift[0],
+                                   c->root_pc);
+    const int cell_w = cfg->ui_w / cols;
+    const int cell_h = cfg->ui_h / rows;
+
+    kb->n_rows = rows;
+    for (int r = 0; r < rows && r < MPE_MAX_ROWS; r++) {
+        kb->row_top_y[r] = cfg->ui_y + r * cell_h;
+        kb->row_h    [r] = cell_h;
+        kb->white_w  [r] = cell_w;
+        kb->black_w  [r] = cell_w;
+        kb->black_h  [r] = cell_h;
+    }
+
+    for (int r = 0; r < rows; r++) {
+        for (int col = 0; col < cols; col++) {
+            if (kb->n_keys >= MPE_MAX_KEYS) break;
+            mpe_key *k = &kb->keys[kb->n_keys++];
+            const int note = base_note + (rows - 1 - r) * row_step + col;
+            k->midi_note = (note < 0) ? 0 : (note > 127 ? 127 : note);
+            k->row       = (r < MPE_MAX_ROWS) ? r : MPE_MAX_ROWS - 1;
+            k->x         = cfg->ui_x + col * cell_w;
+            k->y         = cfg->ui_y + r * cell_h;
+            k->w         = cell_w;
+            k->h         = cell_h;
+            k->is_black  = 0;
+            k->pc        = (uint8_t)(k->midi_note % 12);
+            k->in_scale  = pc_in_scale(k->pc, c->root_pc, c->scale) ? 1 : 0;
+        }
+    }
+}
+
+/* Slide (Bebot-style) layout. One continuous strip spanning the
+   surface, divided into 4 octaves = 48 semitone "cells". Touch
+   anywhere → the cell under your finger fires. Pitch bend, Y, and
+   pressure work exactly like the other layouts; the cells just
+   give the controller's existing hit-test something to find. */
+static void build_slide_(mpe_controller *c)
+{
+    const mpe_controller_cfg *cfg = &c->cfg;
+    mpe_keyboard *kb = &c->kb;
+    kb->n_keys = 0;
+
+    const int total_semis = 48;
+    const int base_note = midi_for(cfg->lowest_octave + c->row_oct_shift[0],
+                                   c->root_pc);
+    const int cell_w = cfg->ui_w / total_semis;
+
+    kb->n_rows = 1;
+    kb->row_top_y[0] = cfg->ui_y;
+    kb->row_h    [0] = cfg->ui_h;
+    kb->white_w  [0] = cell_w;
+    kb->black_w  [0] = cell_w;
+    kb->black_h  [0] = cfg->ui_h;
+
+    for (int s = 0; s < total_semis && kb->n_keys < MPE_MAX_KEYS; s++) {
+        mpe_key *k = &kb->keys[kb->n_keys++];
+        const int note = base_note + s;
+        k->midi_note = (note < 0) ? 0 : (note > 127 ? 127 : note);
+        k->row       = 0;
+        k->x         = cfg->ui_x + s * cell_w;
+        k->y         = cfg->ui_y;
+        k->w         = cell_w;
+        k->h         = cfg->ui_h;
+        k->is_black  = 0;
+        k->pc        = (uint8_t)(k->midi_note % 12);
+        k->in_scale  = pc_in_scale(k->pc, c->root_pc, c->scale) ? 1 : 0;
+    }
+}
+
+void mpe_controller_rebuild_keyboard(mpe_controller *c)
+{
+    switch (c->layout) {
+    case MPE_LAYOUT_GRID:  build_grid_(c);  break;
+    case MPE_LAYOUT_SLIDE: build_slide_(c); break;
+    case MPE_LAYOUT_PIANO:
+    default:               build_piano_(c); break;
+    }
     c->layout_version++;
 }
 
@@ -229,6 +329,8 @@ void mpe_controller_init(mpe_controller *c, const mpe_controller_cfg *cfg)
     c->scale          = MPE_SCALE_CHROMATIC;
     c->root_pc        = 0;
     c->pb_range_live  = cfg->pb_range_semitones;
+    c->pb_mode        = 0;
+    c->layout         = MPE_LAYOUT_PIANO;
     c->layout_version = 0;
     for (int i = 0; i < MPE_MAX_ROWS; i++) c->row_oct_shift[i] = 0;
 
@@ -328,6 +430,11 @@ bool mpe_controller_apply_button(mpe_controller *c, mpe_btn_action a)
         /* Cycle Key → Lin → Wht → Key. */
         c->pb_mode = (c->pb_mode + 1) % 3;
         c->layout_version++;
+        persist_state_(c);
+        return true;
+    case MPE_BTN_CYCLE_LAYOUT:
+        c->layout = (mpe_layout_id)((c->layout + 1) % MPE_NUM_LAYOUTS);
+        mpe_controller_rebuild_keyboard(c);
         persist_state_(c);
         return true;
     case MPE_BTN_ROW0_OCT_DOWN:
