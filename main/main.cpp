@@ -671,14 +671,23 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "static template baked (%zu B, v%u)",
              kFbBytes, (unsigned)baked_version);
 
-    /* 9. Paint the template into the scratch buffer once. The
-       render loop overwrites it every frame anyway, but this gives
-       a clean first frame before the loop starts. */
-    {
+    /* 9. Seed BOTH internal framebuffers with the template content.
+       Critical for num_fbs=2: when the render loop starts, it
+       alternates which FB it paints. Each FB carries whatever was
+       drawn into it last — for one of them that's the boot
+       animation. Without seeding both, the user sees the boot
+       animation alternating with the keyboard at 30 Hz (= flicker)
+       for the first few seconds, and only after both buffers cycle
+       through partial-restore does the lower half of the screen
+       come right. Painting template + present twice ensures both
+       FBs go into the render loop already-cleaned. */
+    for (int i = 0; i < 2; i++) {
         uint16_t *b = mpe_display_back_buffer();
         memcpy(b, s_template, kFbBytes);
         mpe_display_present();
     }
+    s_back_local = 0;  /* matches what mpe_display_present has left
+                          back_idx pointing at after two flips */
 
     /* 10. Kick the realtime touch + MPE dispatch task on CPU 1.
        Pinning matters: the render loop (this task) lives on CPU 0
