@@ -775,6 +775,12 @@ extern "C" void app_main(void)
     bool mpe_config_sent = false;
     int frames = 0;
     int fps_disp = 0;
+    /* Counter for "force full-screen restore on the next N frames"
+       — bumped whenever the static template gets re-baked (any
+       button click that changes scale/root/octave/PB/layout).
+       Each buffer gets repainted in turn so neither shows stale
+       content from the previous template. */
+    int full_restore_pending = 2;
     int64_t last_fps_us = esp_timer_get_time();
 
     /* Local snapshot we render from so we don't hold the controller
@@ -785,17 +791,19 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "entering render loop");
 
     while (true) {
-        /* Has the layout changed (scale/root/octave button tap)?
-           Re-bake the template, then mark BOTH buffers as fully
-           dirty so the next two presents repaint everything. */
+        /* Has the layout changed (scale/root/octave/PB/View tap)?
+           Re-bake the template AND queue 2 frames of full-screen
+           restore so both internal FBs definitely show the new
+           template content from frame 1 — partial-bbox restore
+           on its own would leave the unchanged areas displaying
+           the OLD layout (piano keys still visible after a switch
+           to Grid, etc). */
         const uint32_t live_ver = s_ctrl.layout_version;
         if (live_ver != baked_version) {
             render_template(s_template, &s_ctrl, ui.top_bar_h);
             mpe_display_flush_writes(s_template, kFbBytes);
             baked_version = live_ver;
-            /* Single-FB mode: the render loop full-copies template
-               → scratch every frame, so we don't need any dirty-rect
-               or per-buffer state on a template rebake. */
+            full_restore_pending = 2;
         }
 
         /* Track the AppleMIDI session live state. We re-send the
@@ -901,9 +909,19 @@ extern "C" void app_main(void)
             if (r->x + r->w  > bbox_x1) bbox_x1 = r->x + r->w;
             if (r->y + r->h  > bbox_y1) bbox_y1 = r->y + r->h;
         };
-        const dirty_list_t *my_prev = &s_prev_dirty[s_back_local];
-        for (int i = 0; i < my_prev->n; i++) bbox_extend(&my_prev->r[i]);
-        for (int i = 0; i < cur.n;      i++) bbox_extend(&cur.r[i]);
+        const bool full_restore = (full_restore_pending > 0);
+        if (full_restore) {
+            /* Override the bbox to cover the whole screen. */
+            bbox_x0 = 0;
+            bbox_y0 = 0;
+            bbox_x1 = MPE_DISPLAY_WIDTH;
+            bbox_y1 = MPE_DISPLAY_HEIGHT;
+            full_restore_pending--;
+        } else {
+            const dirty_list_t *my_prev = &s_prev_dirty[s_back_local];
+            for (int i = 0; i < my_prev->n; i++) bbox_extend(&my_prev->r[i]);
+            for (int i = 0; i < cur.n;      i++) bbox_extend(&cur.r[i]);
+        }
 
         if (bbox_x1 > bbox_x0 && bbox_y1 > bbox_y0) {
             mpe_display_rect_copy(back, s_template,
@@ -911,7 +929,17 @@ extern "C" void app_main(void)
                                   bbox_x1 - bbox_x0,
                                   bbox_y1 - bbox_y0);
         }
-        s_prev_dirty[s_back_local] = cur;
+        if (full_restore) {
+            /* Record a full-screen dirty so the OTHER buffer's next
+               partial pass restores everything too — covers the
+               case where this burst only does 1 frame on each
+               buffer. */
+            dirty_list_t full = {};
+            dirty_push(&full, 0, 0, MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT);
+            s_prev_dirty[s_back_local] = full;
+        } else {
+            s_prev_dirty[s_back_local] = cur;
+        }
 
         mpe_ui_status st = {};
         st.wifi_ip        = wifi_ip;
