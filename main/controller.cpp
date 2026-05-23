@@ -363,31 +363,77 @@ static int alloc_member_channel(const mpe_controller *c)
     return -1;
 }
 
-/* Pixel displacement → 14-bit MPE pitch bend.
+/* Pixel position → semitone offset (piecewise-linear chromatic).
  *
- * The mapping is CHROMATIC: pitch-bend is proportional to actual
- * pixel distance, scaled so that one chromatic semitone of motion
- * across the keyboard corresponds to one semitone of bend.
+ * On a piano-style layout the visual semitone spacing is NOT
+ * uniform: white keys are 7 per octave (spaced octave_w/7 apart),
+ * black keys sit between specific pairs, and the natural half-
+ * steps E-F and B-C have NO black key between them. So a single
+ * pixels-per-semitone constant can't make pitch match position
+ * across all keys at once.
  *
- * Earlier this used `1 white-key width = 1 semitone`, which felt
- * wrong because on a piano-style layout white keys are spaced at
- * octave/7 pixels but semitones are spaced at octave/12 — e.g.
- * sliding from C to D (one white-key width = 2 semitones musically)
- * only produced one semitone of bend, an audible mismatch with
- * the on-screen key spacing the user expected.
+ * Instead, model each octave as a piecewise-linear map between
+ * the 12 key centers. Each key center is one tick on the half-
+ * white-key grid (white_w / 2 pixels):
  *
- * Now: octave_w = ui_w / octaves_per_row, semitone_w = octave_w / 12.
- * Slide N pixels → N / semitone_w semitones of bend. The host scales
- * by pb_range so 1 chromatic position of slide = 1 chromatic
- * position of audible pitch, end-to-end. */
-static uint16_t pb_from_displacement(const mpe_controller *c,
-                                     int dx_px, int row)
+ *   C   C#  D   D#  E       F   F#  G   G#  A   A#  B       C
+ *   1   2   3   4   5       7   8   9   10  11  12  13      15
+ *   semi 0..4 (slope 1 in half-units = slope 0.5 in white-units),
+ *   GAP between E and F (no black key at position 6),
+ *   semi 5..11 same pattern,
+ *   GAP between B and next C.
+ *
+ * Linear interpolation between adjacent key-center positions makes
+ * pitch glide smoothly. Sliding from C-center to D-center
+ * (1 white_w = 2 half-units) produces 2 semitones. From E-center to
+ * F-center (1 white_w but a natural half-step) produces 1 semitone.
+ * Audibly matches the visual key spacing exactly. */
+static float chromatic_semitone_at_(const mpe_controller *c, int row, int x_abs)
 {
-    (void)row;
-    const float octave_w = (float)c->cfg.ui_w /
-                           (float)c->cfg.octaves_per_row;
-    const float semitone_w = octave_w / 12.0f;
-    const float bend_semis = (float)dx_px / semitone_w;
+    const int white_w = c->kb.white_w[clampi(row, 0, MPE_MAX_ROWS - 1)];
+    if (white_w <= 0) return 0.0f;
+    const float half_w = (float)white_w / 2.0f;
+    const float pos_units = (float)(x_abs - c->cfg.ui_x) / half_w;
+
+    /* 14 half-units per octave (7 white_w). */
+    const float OCT_UNITS = 14.0f;
+    const float octave_idx = floorf(pos_units / OCT_UNITS);
+    const float within_oct = pos_units - octave_idx * OCT_UNITS;
+
+    /* Key-center positions (in half_w units within an octave). 13
+       entries covering semitones 0..12 (C up to next C). */
+    static const float pos_table[13] = {
+        1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 15
+    };
+
+    float semis_in_oct;
+    if (within_oct <= pos_table[0]) {
+        /* Off the bottom (left of C center) — extrapolate. */
+        semis_in_oct = within_oct - pos_table[0];
+    } else if (within_oct >= pos_table[12]) {
+        /* Off the top (right of next C center). */
+        semis_in_oct = 12.0f + (within_oct - pos_table[12]);
+    } else {
+        /* Find bracketing centers and lerp. */
+        int s = 0;
+        while (s < 12 && within_oct >= pos_table[s + 1]) s++;
+        const float lo = pos_table[s];
+        const float hi = pos_table[s + 1];
+        const float frac = (within_oct - lo) / (hi - lo);
+        semis_in_oct = (float)s + frac;
+    }
+    return octave_idx * 12.0f + semis_in_oct;
+}
+
+/* Pixel displacement → 14-bit MPE pitch bend, using the piecewise-
+   linear chromatic map above. dx_px is signed displacement from
+   init_x_px (the anchor when the finger landed). */
+static uint16_t pb_from_displacement(const mpe_controller *c,
+                                     int init_x, int dx_px, int row)
+{
+    const float init_semi = chromatic_semitone_at_(c, row, init_x);
+    const float cur_semi  = chromatic_semitone_at_(c, row, init_x + dx_px);
+    const float bend_semis = cur_semi - init_semi;
     const float bend_norm  = bend_semis / (float)c->pb_range_live;
     int v = 0x2000 + (int)(bend_norm * 8192.0f);
     return (uint16_t)clampi(v, 0, 0x3FFF);
@@ -564,7 +610,7 @@ int mpe_controller_update(mpe_controller *c, const mpe_touch_frame *f)
         /* GLIDE — pitch bend from snap anchor displacement; deadband
            filters sub-pixel jitter. */
         const int dx_px = p->x - fg->init_x_px;
-        uint16_t pb = pb_from_displacement(c, dx_px,
+        uint16_t pb = pb_from_displacement(c, fg->init_x_px, dx_px,
                                            c->kb.keys[fg->key_idx].row);
         const int pb_delta = (int)pb - (int)fg->last_pb;
         if (pb_delta > 12 || pb_delta < -12 || pb == 0x2000) {
