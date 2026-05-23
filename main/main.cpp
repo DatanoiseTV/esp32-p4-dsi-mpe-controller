@@ -67,10 +67,10 @@ static mpe_controller         s_ctrl;
 static std::atomic<int>       s_active_fingers{0};
 /* When a finger releases, the touch task bumps this counter. The
    render task drains it by doing a FULL template→back-buffer
-   memcpy on the next N frames instead of partial-restore. Brute-
-   force backstop against any partial-restore corner case that
-   could leave a "frozen mid-movement" ghost on the buffers (the
-   user-reported "going back between 2 frames" symptom). */
+   the touch task signals via this counter and the render task
+   does additional cleanup work for the next few frames. Kept as
+   a no-op stub after the single-FB refactor since the residual
+   queue + per-frame full template restore make it redundant. */
 static std::atomic<int>       s_force_full_restore{0};
 static mpe_touch_frame        s_latest_tf;
 
@@ -79,60 +79,46 @@ static uint16_t              *s_template = nullptr;
 static const size_t           kFbBytes = (size_t)MPE_DISPLAY_WIDTH *
                                           MPE_DISPLAY_HEIGHT * 2;
 
-/* --- Dirty-rect partial-redraw machinery -------------------------- *
+/* --- Dirty-rect partial restore (single-FB version) -------------- *
  *
- * Full-screen memcpy every frame at 1.2 MB / ~150 MB/s PSRAM
- * bandwidth caps us at ~10 FPS before we even draw anything. The
- * dynamic surface area (5 fingers × ~200×200 glow boxes + the
- * status info area) is much smaller. We:
+ * Full-screen template copy every frame burns ~3 MB of PSRAM
+ * bandwidth (template→scratch PPA + driver scratch→internal-FB
+ * DMA), pinning FPS to ~13. The dynamic surface area (status row +
+ * 5 finger dots + key activity zones) is much smaller. We:
+ *   1. Compute cur dirty rects from snap state.
+ *   2. Restore (template → scratch) the UNION of prev_dirty
+ *      (where we wrote last frame) + cur (where we're about to
+ *      write).
+ *   3. Render dynamics into those areas.
+ *   4. Save cur for next frame's restore.
  *
- *   1. Initialize both display buffers with the static template
- *      at startup so the steady state is correct everywhere.
- *   2. Per buffer, track the bounding boxes we PAINTED LAST TIME
- *      we used that buffer (`s_prev_dirty[idx]`). Because we
- *      double-buffer, the back buffer we're about to paint still
- *      holds the dynamics from two frames ago.
- *   3. Each frame: restore template into the *union* of last-time
- *      dirty + this-time dirty rects, then draw the current
- *      dynamics on top.
- *
- * Net cost per frame: ~200-300 KB of PSRAM bandwidth instead of
- * 1.2 MB. */
-typedef struct { int x, y, w, h; } rect_t;
-#define MAX_DIRTY_RECTS 16
+ * Single buffer = no per-buffer history, no force-restore bursts. */
+typedef struct { int16_t x, y, w, h; } rect_t;
+#define MAX_DIRTY_RECTS 24
 typedef struct { rect_t r[MAX_DIRTY_RECTS]; int n; } dirty_list_t;
 
-static dirty_list_t s_prev_dirty[2] = {};
-static int          s_back_local    = 0;   /* mirrors mpe_display's idx */
+static dirty_list_t s_prev_dirty = {};
 
 static inline void rect_clip_(rect_t *r)
 {
-    if (r->x < 0) { r->w += r->x; r->x = 0; }
-    if (r->y < 0) { r->h += r->y; r->y = 0; }
-    if (r->x + r->w > MPE_DISPLAY_WIDTH)
-        r->w = MPE_DISPLAY_WIDTH - r->x;
-    if (r->y + r->h > MPE_DISPLAY_HEIGHT)
-        r->h = MPE_DISPLAY_HEIGHT - r->y;
-    if (r->w < 0) r->w = 0;
-    if (r->h < 0) r->h = 0;
+    int x = r->x, y = r->y, w = r->w, h = r->h;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > MPE_DISPLAY_WIDTH)  w = MPE_DISPLAY_WIDTH  - x;
+    if (y + h > MPE_DISPLAY_HEIGHT) h = MPE_DISPLAY_HEIGHT - y;
+    if (w < 0) w = 0;
+    if (h < 0) h = 0;
+    r->x = (int16_t)x; r->y = (int16_t)y;
+    r->w = (int16_t)w; r->h = (int16_t)h;
 }
 
 static void dirty_push(dirty_list_t *d, int x, int y, int w, int h)
 {
     if (d->n >= MAX_DIRTY_RECTS) return;
-    rect_t r = { x, y, w, h };
+    rect_t r = { (int16_t)x, (int16_t)y, (int16_t)w, (int16_t)h };
     rect_clip_(&r);
     if (r.w == 0 || r.h == 0) return;
     d->r[d->n++] = r;
-}
-
-/* Per-rect restore from template→back. Defers to the display
-   component's PPA-accelerated path, which transparently falls back
-   to CPU memcpy for rects too small to amortise the PPA setup
-   overhead. */
-static void restore_rect_(uint16_t *back, const uint16_t *templ, rect_t r)
-{
-    mpe_display_rect_copy(back, templ, r.x, r.y, r.w, r.h);
 }
 
 /* --- Boot-screen animation -------------------------------------- *
@@ -735,10 +721,9 @@ extern "C" void app_main(void)
             render_template(s_template, &s_ctrl, ui.top_bar_h);
             mpe_display_flush_writes(s_template, kFbBytes);
             baked_version = live_ver;
-            dirty_list_t full = {};
-            dirty_push(&full, 0, 0, MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT);
-            s_prev_dirty[0] = full;
-            s_prev_dirty[1] = full;
+            /* Single-FB mode: the render loop full-copies template
+               → scratch every frame, so we don't need any dirty-rect
+               or per-buffer state on a template rebake. */
         }
 
         /* Track the AppleMIDI session live state. We re-send the
@@ -775,25 +760,58 @@ extern "C" void app_main(void)
         mpe_controller_unlock(&s_ctrl);
         snap_ctrl.lock = nullptr;
         (void)s_force_full_restore;
-        (void)s_back_local;
         (void)ui;
 
-        /* Single-FB architecture (post esp-bsp #581 finding).
-           num_fbs=2 is broken in IDF v6.0; we now own a scratch
-           buffer, paint a fresh full frame into it, and let
-           draw_bitmap copy it into the driver's internal FB. All
-           the partial-restore / dirty-rect / force-restore
-           machinery for the old buffer-pair model is gone. */
+        /* Single-FB + partial restore. The full-template-per-frame
+           variant burns ~3 MB/frame of PSRAM bandwidth and tops out
+           at 13 FPS; restoring only the small dirty bbox keeps the
+           PSRAM hot path manageable. */
         uint16_t *back = mpe_display_back_buffer();
         mp_target target = { back, MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT };
 
-        /* Full template → scratch via PPA (DMA, ~3-5 ms at 1.2 MB
-           on this stack — vs ~30 ms for CPU memcpy). The driver
-           handles cache management on draw_bitmap; we don't need
-           to track dirty rects ourselves. */
-        mpe_display_rect_copy(back, s_template,
-                              0, 0,
-                              MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT);
+        /* Compute this frame's dirty list: status text row +
+           every active or recently-released finger area. */
+        dirty_list_t cur = {};
+        dirty_push(&cur, 0, MPE_UI_STATUS_Y,
+                   MPE_DISPLAY_WIDTH, MPE_UI_STATUS_H);
+
+        const int glow_margin = 44;
+        for (int i = 0; i < MPE_CTRL_MAX_FINGERS; i++) {
+            const mpe_finger *f = &snap_ctrl.fingers[i];
+            if (!f->active || f->is_ui) continue;
+            const int px = snap_ctrl.cfg.ui_x +
+                           (int)(f->x_norm * (float)snap_ctrl.cfg.ui_w);
+            const int py = snap_ctrl.cfg.ui_y +
+                           (int)((1.0f - f->y_norm) * (float)snap_ctrl.cfg.ui_h);
+            dirty_push(&cur,
+                       px - glow_margin, py - glow_margin,
+                       2 * glow_margin, 2 * glow_margin);
+        }
+        for (int i = 0; i < snap_tf.count && i < MPE_TOUCH_MAX_POINTS; i++) {
+            int px = snap_tf.points[i].x;
+            int py = snap_tf.points[i].y;
+            dirty_push(&cur,
+                       px - glow_margin, py - glow_margin,
+                       2 * glow_margin, 2 * glow_margin);
+        }
+        for (int i = 0; i < snap_ctrl.n_residual; i++) {
+            const mpe_residual_dirty *r = &snap_ctrl.residual[i];
+            dirty_push(&cur, r->x - 4, r->y - 4, r->w + 8, r->h + 8);
+        }
+
+        /* Restore union of (last frame's writes) + (this frame's
+           writes) from template to scratch via PPA. The PPA SRM
+           DMA path is much faster than CPU memcpy for these
+           medium-sized rects. */
+        for (int i = 0; i < s_prev_dirty.n; i++) {
+            const rect_t *r = &s_prev_dirty.r[i];
+            mpe_display_rect_copy(back, s_template, r->x, r->y, r->w, r->h);
+        }
+        for (int i = 0; i < cur.n; i++) {
+            const rect_t *r = &cur.r[i];
+            mpe_display_rect_copy(back, s_template, r->x, r->y, r->w, r->h);
+        }
+        s_prev_dirty = cur;
 
         mpe_ui_status st = {};
         st.wifi_ip        = wifi_ip;

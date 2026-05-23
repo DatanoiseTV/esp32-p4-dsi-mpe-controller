@@ -275,9 +275,8 @@ esp_err_t mpe_display_init(void)
         mpe_display_set_backlight(CONFIG_DISP_BL_DEFAULT_PCT),
         TAG, "bl on");
 
-    ESP_LOGI(TAG, "LCD up: %dx%d RGB565, %d fbs (back=%p, front=%p)",
-             MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT, LCD_NUM_FBS,
-             (void *)s_fbs[0], (void *)s_fbs[1]);
+    ESP_LOGI(TAG, "LCD up: %dx%d RGB565, single-FB + scratch=%p",
+             MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT, (void *)s_scratch);
     return ESP_OK;
 }
 
