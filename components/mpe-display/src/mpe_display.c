@@ -402,36 +402,42 @@ void mpe_display_flush_writes(void *buf, size_t bytes)
 
 esp_err_t mpe_display_present_y(int y0, int h)
 {
-    (void)y0; (void)h;
-    return mpe_display_present();   /* single-FB: no Y optimisation */
-}
-
-esp_err_t mpe_display_present(void)
-{
     if (!s_panel || !s_vsync_sem || !s_scratch) return ESP_ERR_INVALID_STATE;
 
-    /* Flush our CPU writes from cache → PSRAM so the driver's DMA
-       sees fresh pixels. */
-    const size_t fb_bytes =
-        (size_t)MPE_DISPLAY_WIDTH * MPE_DISPLAY_HEIGHT * 2;
-    esp_cache_msync(s_scratch, fb_bytes,
-                    ESP_CACHE_MSYNC_FLAG_DIR_C2M |
-                    ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    /* Clip + validate. */
+    if (y0 < 0) { h += y0; y0 = 0; }
+    if (y0 + h > MPE_DISPLAY_HEIGHT) h = MPE_DISPLAY_HEIGHT - y0;
+    if (h <= 0) return ESP_OK;
 
+    /* Flush only the dirty Y rows from cache → PSRAM. Each row is
+       MPE_DISPLAY_WIDTH * 2 = 2048 B = 32 cache lines exactly, so
+       the range is naturally cache-line aligned. Massive win vs the
+       full-FB flush: a 26-row status update flushes 52 KB instead
+       of 1.2 MB. */
+    const size_t row_bytes = (size_t)MPE_DISPLAY_WIDTH * 2;
+    uint8_t *flush_start = (uint8_t *)s_scratch + (size_t)y0 * row_bytes;
+    size_t   flush_span  = (size_t)h * row_bytes;
+    esp_cache_msync(flush_start, flush_span,
+                    ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
+    /* Tell the driver to copy ONLY the dirty Y band into its
+       internal framebuffer. Driver pulls (0, y0) .. (W, y0+h) from
+       our scratch via DMA — small bands are dramatically less DMA
+       traffic than the full FB every frame. */
     esp_err_t err = esp_lcd_panel_draw_bitmap(
-        s_panel, 0, 0,
-        MPE_DISPLAY_WIDTH, MPE_DISPLAY_HEIGHT,
+        s_panel, 0, y0,
+        MPE_DISPLAY_WIDTH, y0 + h,
         s_scratch);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "draw_bitmap failed: %s", esp_err_to_name(err));
         return err;
     }
 
-    /* on_color_trans_done DOES fire reliably in single-FB mode
-       (verified by the PavelMostovoy/ESP32-P4-minimal-DSI-demo).
-       This blocks until the panel has actually finished scanning
-       our buffer into its internal FB — natural pacing to the
-       refresh rate without us managing buffer indices. */
     xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(100));
     return ESP_OK;
+}
+
+esp_err_t mpe_display_present(void)
+{
+    return mpe_display_present_y(0, MPE_DISPLAY_HEIGHT);
 }

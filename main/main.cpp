@@ -824,7 +824,26 @@ extern "C" void app_main(void)
 
         mpe_ui_render(&ui, &target, &snap_ctrl, &snap_tf, &st);
 
-        mpe_display_present();
+        /* Present only the actual dirty Y band — the driver's DMA
+           is the dominant per-frame cost and copying full 1.2 MB
+           every frame burns ~15 ms regardless of how little we
+           changed. Computing the bbox from prev+cur dirty rects
+           keeps the DMA work proportional to what we drew. */
+        int present_y_min = MPE_DISPLAY_HEIGHT;
+        int present_y_max = 0;
+        for (int i = 0; i < s_prev_dirty.n; i++) {
+            const rect_t *r = &s_prev_dirty.r[i];
+            if (r->y < present_y_min) present_y_min = r->y;
+            if (r->y + r->h > present_y_max) present_y_max = r->y + r->h;
+        }
+        if (present_y_max > present_y_min) {
+            mpe_display_present_y(present_y_min,
+                                  present_y_max - present_y_min);
+        } else {
+            /* Nothing to show this frame (no dirty area) — still
+               present so the driver's swap chain ticks. */
+            mpe_display_present_y(0, 1);
+        }
 
         frames++;
         const int64_t now = esp_timer_get_time();
